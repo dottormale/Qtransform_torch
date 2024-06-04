@@ -7,7 +7,7 @@ import torch
 
 #---------------------------------------------------
 # MAIN FUNCTION 2D
-def spline_interpolate_2d(Z, num_t_bins, num_f_bins, logf=False, kx=3, ky=3, s=0.001):
+def spline_interpolate_2d(Z, num_t_bins, num_f_bins, logf=False, kx=3, ky=3, sx=0.001,sy=0.001):
     # Empty cache
     try:
         torch.cuda.empty_cache()
@@ -16,14 +16,17 @@ def spline_interpolate_2d(Z, num_t_bins, num_f_bins, logf=False, kx=3, ky=3, s=0
         pass
     
     nx_points, ny_points = Z.shape
+    print(f'{nx_points=}')
+    print(f'{ny_points=}')
+    
     x = torch.linspace(-1, 1, nx_points)
     y = torch.linspace(-1, 1, ny_points)
         
-    coef, tx, ty = bivariate_spline_fit_natural_torch(x, y, Z, kx, ky, s)
+    coef, tx, ty = bivariate_spline_fit_natural_torch(x, y, Z, kx, ky, sx,sy)
     
     x_eval = torch.linspace(-1, 1, num_t_bins)
     y_eval = torch.linspace(-1, 1, num_f_bins)
-    Z_interp = evaluate_bivariate_spline_torch(x_eval, y_eval, coef, tx, ty, kx, ky).view(num_t_bins, num_f_bins)
+    Z_interp = evaluate_bivariate_spline_torch(x_eval, y_eval, coef, tx, ty, kx, ky)
     return Z_interp
 
 # MAIN FUNCTION 1D
@@ -36,11 +39,11 @@ def spline_interpolate(Z, num_x_bins, kx=3, s=0.001):
         pass
     
     nx_points = Z.shape[0]
-    x = torch.linspace(-1, 1, nx_points, device=Z.device)
+    x = torch.linspace(-1, 1, nx_points)
         
     coef, tx = spline_fit_natural_torch(x, Z, kx, s)
     
-    x_eval = torch.linspace(-1, 1, num_x_bins, device=Z.device)
+    x_eval = torch.linspace(-1, 1, num_x_bins)
     Z_interp = evaluate_spline_torch(x_eval, coef, tx, kx).view(num_x_bins)
     return Z_interp
 
@@ -73,8 +76,8 @@ def compute_L_R(x, t, d, m, k):
     
     return L, R
 
-def zeroth_order(x, k, t, n, m, device):
-    b = torch.zeros((n, m, k + 1), device=device)
+def zeroth_order(x, k, t, n, m):
+    b = torch.zeros((n, m, k + 1))
     
     mask_lower = t[:m+1].unsqueeze(0)[:, :-1] <= x.unsqueeze(1)
     mask_upper = x.unsqueeze(1) < t[:m+1].unsqueeze(0)[:, 1:]
@@ -85,7 +88,7 @@ def zeroth_order(x, k, t, n, m, device):
     b[:, -1, 0] = torch.where(x >= t[-2], torch.ones_like(x), b[:, -1, 0])
     return b
 
-def bspline_basis_natural_torch(x, k, t, device):
+def bspline_basis_natural_torch(x, k, t):
     n = x.shape[0]
     m = t.shape[0] - k - 1
     
@@ -95,7 +98,7 @@ def bspline_basis_natural_torch(x, k, t, device):
         L, R = compute_L_R(x, t, d, m, k)
         left = L * b[:, :, d-1]
 
-        zeros_tensor = torch.zeros(b.shape[0], 1, device=device)
+        zeros_tensor = torch.zeros(b.shape[0], 1)
         temp_b = torch.cat([b[:, 1:, d-1], zeros_tensor], dim=1)
     
         right = R * temp_b
@@ -106,64 +109,74 @@ def bspline_basis_natural_torch(x, k, t, device):
 def spline_fit_natural_torch(x, z, kx, s):
     tx = generate_natural_knots(x, kx)
 
-    bx = bspline_basis_natural_torch(x, kx, tx)
+    bx = bspline_basis_natural_torch(x, kx, tx).to(z.device)
 
     z_flat = z.view(-1)
 
     m = bx.size(1)
     I = torch.eye(m, device=z.device)
-    C = torch.zeros(m, m, device=z.device)
 
-    for i in range(1, kx):
-        C[i, i] = 1
-        C[-i, -i] = 1
-
-    B_T_B = bx.T @ bx + s * (I + C)
+    B_T_B = bx.T @ bx + s * I 
     B_T_z = bx.T @ z_flat
     
     coef = torch.linalg.solve(B_T_B, B_T_z)
     
-    return coef, tx
+    return coef.to(z.device), tx
 
-def bivariate_spline_fit_natural_torch(x, y, z, kx, ky, s):
+def bivariate_spline_fit_natural_torch(x, y, z, kx,ky, sx=0.001,sy=0.001):
     tx = generate_natural_knots(x, kx)
     ty = generate_natural_knots(y, ky)
 
-    bx = bspline_basis_natural_torch(x, kx, tx,z.device)
-    by = bspline_basis_natural_torch(y, ky, ty,z.device)
+    Bx = bspline_basis_natural_torch(x, kx, tx)
+    By = bspline_basis_natural_torch(y, ky, ty)
 
-    BxBy = torch.einsum('ij,kl->ikjl', bx, by).view(-1, bx.size(1) * by.size(1))
+    print(f'{Bx.shape=}')
+    print(f'{x.shape=}')
+    print(f'{tx.shape=}')
+    print('--------------------------------\n')
+    print(f'{By.shape=}')
+    print(f'{y.shape=}')
+    print(f'{ty.shape=}')
+    print('--------------------------------\n')
+    print(f'{z.shape=}')
 
-    z_flat = z.view(-1).to(x.device)
+    # Adding regularization 
+    mx = Bx.size(1)
+    my = By.size(1)
+    Ix = torch.eye(mx, device=Bx.device)
+    Iy = torch.eye(my, device=By.device)
 
-    m = BxBy.size(1)
-    I = torch.eye(m, device=BxBy.device)
-    C = torch.zeros(m, m, device=BxBy.device)
+
+    # First step: solve for E 
+    ByT_By = By.T @ By + sy * Iy
+    ByT_Z_Bx = (By.T @ z.T) @ Bx
+    E = torch.linalg.solve(ByT_By, ByT_Z_Bx)
+
+    # Second step: solve for final control points C 
+    BxT_Bx = Bx.T @ Bx + sx * Ix
+    C = torch.linalg.solve(BxT_Bx, E.T).T
+
+    return C, tx, ty
+
+def evaluate_bivariate_spline_torch(x, y, C, tx, ty, kx,ky):
     
-    #enforce natural boundary conditions
-    for i in range(1, kx):
-        C[i, i] = 1
-        C[-i, -i] = 1
-    for j in range(1, ky):
-        C[j * bx.size(1), j * bx.size(1)] = 1
-        C[-j * bx.size(1), -j * bx.size(1)] = 1
-
-    B_T_B = BxBy.T @ BxBy + s * (I + C)
-    B_T_z = BxBy.T @ z_flat
     
-    coef = torch.linalg.solve(B_T_B, B_T_z)
-    
-    return coef.detach().numpy(), tx, ty
-
-def evaluate_bivariate_spline_torch(x, y, coef, tx, ty, kx, ky):
-    bx = bspline_basis_natural_torch(x, kx, tx)
-    by = bspline_basis_natural_torch(y, ky, ty)
-    B = torch.einsum('ij,kl->ikjl', bx, by).view(-1, bx.size(1) * by.size(1))
-    z_eval = B @ coef
-    return z_eval
+    Bx = bspline_basis_natural_torch(x, kx, tx)
+    By = bspline_basis_natural_torch(y, ky, ty)
+    print('EVALUATE!')
+    print(f'{Bx.shape=}')
+    print(f'{x.shape=}')
+    print(f'{tx.shape=}')
+    print('--------------------------------\n')
+    print(f'{By.shape=}')
+    print(f'{y.shape=}')
+    print(f'{ty.shape=}')
+    print('--------------------------------\n')
+    print(f'{C.shape=}')
+    return (Bx@C.T)@By.T #torch.einsum('ij,jk,lk->il', Bx, C, By)
 
 def evaluate_spline_torch(x, coef, tx, kx):
-    bx = bspline_basis_natural_torch(x, kx, tx)
+    bx = bspline_basis_natural_torch(x, kx, tx).to(coef.device)
     z_eval = bx @ coef
     return z_eval
         
