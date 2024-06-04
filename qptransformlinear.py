@@ -200,8 +200,8 @@ class SingleQTransformLinear(torch.nn.Module):
         for qtile in self.qtiles:
             #NCS=NaturalCubicSpline(natural_cubic_spline_coeffs(torch.linspace(0, 1, qtile.shape[-1]).to(device), qtile.unsqueeze(-1)))
             #print(f'{qtile.squeeze(0).squeeze(0).shape=}')
-            if qtile.squeeze(0).squeeze(0).shape[0]!=x_bins:
-                NCS=spline_interpolate(qtile.squeeze(0).squeeze(0),x_bins)
+            if qtile.squeeze(0).squeeze(0).shape[0]!=num_t_bins:
+                NCS=spline_interpolate(qtile.squeeze(0).squeeze(0),num_t_bins)
             else:
                 NCS=qtile.squeeze(0).squeeze(0)
             resampled.append(NCS)
@@ -210,12 +210,15 @@ class SingleQTransformLinear(torch.nn.Module):
         resampled = torch.stack(resampled, dim=-2)
         resampled = resampled.squeeze(-1).squeeze()
         print("Shape after time dimension interpolation:", resampled.shape)
-        resampled=spline_interpolate_2d(resampled,num_t_bins,num_f_bins,False,3,3,0.001)      
+        print("if transposed:", resampled.T.shape)
+        return(resampled.T)
+        
+        '''resampled=spline_interpolate_2d(resampled.T,num_t_bins,num_f_bins,False,3,3,0.001,0.001)      
         
 
         print("Final shape after frequency dimension interpolation:", resampled.shape)
 
-        return resampled.to(device)
+        return resampled.to(device)'''
 
 
 
