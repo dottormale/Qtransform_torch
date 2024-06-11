@@ -3,7 +3,6 @@ from typing import List
 
 import torch
 import torch.nn.functional as F
-#from torchcubicspline import(natural_cubic_spline_coeffs, NaturalCubicSpline) #https://github.com/patrick-kidger/torchcubicspline/tree/master not used but might be interesting for speed up ideas
 
 from torch_spline_interpolation import *
 
@@ -183,10 +182,13 @@ class SingleQTransformLinear(torch.nn.Module):
                 "Q-tiles must first be computed with .compute_qtiles()"
             )
 
-        #print("Shapes before interpolation:")
-        #print("Q-tiles shapes:", [qtile.shape for qtile in self.qtiles])
-        #print(f'{type(self.qtiles)=}')
-        print(f'{type(self.qtiles)=}')
+         
+        #Uncomment to return only qtiles. Needed to test 1D interpolation
+        print('Returning Qtiles!!')
+        return self.qtiles
+        
+        
+
         # Extract time values
         t = torch.linspace(0, 1, num_t_bins).to(device)
         
@@ -197,28 +199,19 @@ class SingleQTransformLinear(torch.nn.Module):
         print(f'{x_bins=}')
         # Interpolate along the time dimension using natural cubic spline
         resampled=[]
+
+        #ToDO: Tensorize the following for loop. Pad each qtile to the size of the largest qtile and convert list to tensor using torch.stack. Then implement batch dimension in torch_spline_interpolation.spline_interpolate to pass the whole tensor at once.
+        
         for qtile in self.qtiles:
-            #NCS=NaturalCubicSpline(natural_cubic_spline_coeffs(torch.linspace(0, 1, qtile.shape[-1]).to(device), qtile.unsqueeze(-1)))
-            #print(f'{qtile.squeeze(0).squeeze(0).shape=}')
-            if qtile.squeeze(0).squeeze(0).shape[0]!=num_t_bins:
-                NCS=spline_interpolate(qtile.squeeze(0).squeeze(0),num_t_bins)
-            else:
-                NCS=qtile.squeeze(0).squeeze(0)
+            NCS=spline_interpolate(qtile.squeeze(0).squeeze(0),num_t_bins,s=0.001)
             resampled.append(NCS)
             
-        #resampled = [spline.evaluate(t) for spline in resampled]
         resampled = torch.stack(resampled, dim=-2)
         resampled = resampled.squeeze(-1).squeeze()
-        print("Shape after time dimension interpolation:", resampled.shape)
-        print("if transposed:", resampled.T.shape)
-        return(resampled.T)
         
-        '''resampled=spline_interpolate_2d(resampled.T,num_t_bins,num_f_bins,False,3,3,0.001,0.001)      
-        
+        resampled=spline_interpolate_2d(resampled.T,num_t_bins,num_f_bins,False,3,3,0.001,0.001)      
 
-        print("Final shape after frequency dimension interpolation:", resampled.shape)
-
-        return resampled.to(device)'''
+        return resampled.to(device)
 
 
 
