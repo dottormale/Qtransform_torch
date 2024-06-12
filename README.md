@@ -96,6 +96,12 @@ This module provides functionality for Q-transform linear interpolation using Py
 - `QScan`: Class for handling Q-scan operations.
 - `SingleQTransformLinear`: Class for performing single Q-transform linear interpolation.
 
+### qtransform.py
+
+This module provides functionality for Q-transform interpolation using PyTorch.
+The package is the same as https://github.com/ML4GW/ml4gw/blob/dev/ml4gw/transforms/qtransform.py
+with the only difference being the interpolation methods implemented in torch_spline_interpolation.py replacing pytorch's standart interpolation methods.
+
 ### torch_smoothing_spline_interpolation.py
 
 This module provides functions for performing smoothing spline interpolation using PyTorch:
