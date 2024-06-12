@@ -115,10 +115,10 @@ def generate_natural_knots(x, k):
 
 def compute_L_R(x, t, d, m, k):
     
-    """
+    '''
     Compute the L and R values for B-spline basis functions.
     L and R are respectively the firs and second coefficient multiplying B_{i,p-1}(x) and B_{i+1,p-1}(x) in De Boor's recursive formula for Bspline basis funciton computation:
-    {\displaystyle B_{i,p}(x):={\frac {x-t_{i}}{t_{i+p}-t_{i}}}B_{i,p-1}(x)+{\frac {t_{i+p+1}-x}{t_{i+p+1}-t_{i+1}}}B_{i+1,p-1}(x).}
+    #{\displaystyle B_{i,p}(x):={\frac {x-t_{i}}{t_{i+p}-t_{i}}}B_{i,p-1}(x)+{\frac {t_{i+p+1}-x}{t_{i+p+1}-t_{i+1}}}B_{i+1,p-1}(x).}
     See https://en.wikipedia.org/wiki/De_Boor%27s_algorithm for further details
 
     Args:
@@ -131,7 +131,7 @@ def compute_L_R(x, t, d, m, k):
     Returns:
         L: Tensor containing left values for the B-spline basis functions.
         R: Tensor containing right values for the B-spline basis functions.
-    """
+    '''
     left_num = x.unsqueeze(1) - t[:m].unsqueeze(0)
     left_den = t[d:m+d] - t[:m]
     L = left_num / left_den.unsqueeze(0)
@@ -179,6 +179,7 @@ def zeroth_order(x, k, t, n, m):
     return b
 
 def bspline_basis_natural_torch(x, k, t):
+    
     '''
     Compute bspline basis function using de Boor's recursive formula (See https://en.wikipedia.org/wiki/De_Boor%27s_algorithm for reference)
     Args:
@@ -390,12 +391,12 @@ def visualize_knots_and_basis(x, k, knots, basis, title):
     # Plot basis functions
     plt.subplot(1, 2, 2)  # Create subplot at position 1, row 1, column 1
     for i in range(basis.size(1)):
-    plt.plot(x.cpu(), basis[:, i].cpu(), label=f'B{i}')  # Plot each basis function with label Bi
-    plt.title(f'{title} Basis Functions')
-    plt.xlabel('x')
-    plt.ylabel('Value')
-    plt.legend()
-    
+        plt.plot(x.cpu(), basis[:, i].cpu(), label=f'B{i}')  # Plot each basis function with label Bi
+        plt.title(f'{title} Basis Functions')
+        plt.xlabel('x')
+        plt.ylabel('Value')
+        plt.legend()
+        
     plt.show()  # Display the plot
 
 def analyze_coefficients(coef):
@@ -426,11 +427,11 @@ def print_basis_functions(x, k, knots, basis):
     """
     
     for i in range(basis.size(1)):
-    print(f'Basis function B{i}:')
-    for j in range(basis.size(0)):
-      # Print x value with 2 decimal places and basis function value with 6 decimal places
-      print(f'  x = {x[j].item():.2f}: {basis[j, i].item():.6f}')
-    print('')  # Print an empty line after each basis function
+        print(f'Basis function B{i}:')
+        for j in range(basis.size(0)):
+            # Print x value with 2 decimal places and basis function value with 6 decimal places
+            print(f'  x = {x[j].item():.2f}: {basis[j, i].item():.6f}')
+        print('')  # Print an empty line after each basis function
 #------------------------------------------------------------------------------------
 
 #---------------------------------------
