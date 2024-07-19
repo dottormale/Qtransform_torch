@@ -8,7 +8,7 @@ from matplotlib import gridspec
 
 #---------------------------------------------------
 # MAIN FUNCTION 2D
-def spline_interpolate_2d(Z, num_t_bins, num_f_bins, logf=False, kx=3, ky=3, sx=0.001,sy=0.001):
+def spline_interpolate_2d(Z, num_t_bins, num_f_bins, logf=True, kx=3, ky=3, sx=0.001,sy=0.001,frange=(10,100),freqs=None,xin=None,xout=None,yin=None,yout=None):
     """
       This function performs 2D natural spline interpolation on a given data set.
     
@@ -38,22 +38,59 @@ def spline_interpolate_2d(Z, num_t_bins, num_f_bins, logf=False, kx=3, ky=3, sx=
     # Construct datapoint grid
     nx_points, ny_points = Z.shape
     
-    x = torch.linspace(-1, 1, nx_points)
+    if xin==None:
+        x = torch.linspace(-1, 1, nx_points)
+    else:
+        x=xin
     
     #ToDo: implement logf=True case
-    y = torch.linspace(-1, 1, ny_points)
+    print(f'{freqs=}')
+    print(f'{frange=}')
+    
+    if freqs!=None:
+        #y=map_to_range(freqs, new_min=-1, new_max=1)
+        y=freqs
+        print('freqs passed')
+        print(f'{y=}')
+    elif yin == None:
+        if logf:
+            #y=map_to_range(torch.tensor(np.geomspace(frange[0],frange[1],ny_points)))
+            y=torch.tensor(np.geomspace(frange[0],frange[1],num=ny_points))
+        else:
+            y = torch.linspace(-1, 1, ny_points)
+    else:
+        print('y set to yin')
+        y=yin
 
     #compute bspline coefficients
     coef, tx, ty = bivariate_spline_fit_natural_torch(x, y, Z, kx, ky, sx,sy)
 
     #inerpolate
-    x_eval = torch.linspace(-1, 1, num_t_bins)
-    y_eval = torch.linspace(-1, 1, num_f_bins)
+    if xout==None:
+        x_eval = torch.linspace(-1, 1, num_t_bins)
+    else:
+        x_eval=xout
+
+    if yout!=None:
+        print('y_eval set to yout')
+        y_eval=yout
+        
+    else:
+        if logf:
+            #y_eval = map_to_range(torch.tensor(np.geomspace(frange[0],frange[1],num_f_bins)))
+    
+            y_eval = torch.tensor(np.geomspace(frange[0],frange[1],num=num_f_bins))
+            print(f'{y_eval=}')
+        else:
+            y_eval = torch.linspace(-1, 1, num_f_bins)
+    
+    print(f'{y=}') 
+    print(f'{y_eval=}') 
     Z_interp = evaluate_bivariate_spline_torch(x_eval, y_eval, coef, tx, ty, kx, ky)
     return Z_interp
 
 # MAIN FUNCTION 1D
-def spline_interpolate(Z, num_x_bins, kx=3, s=0.1):
+def spline_interpolate(Z, num_x_bins, kx=3, s=0.1,xin=None,xout=None):
     """
   This function performs 1D spline interpolation on a given data set.
 
@@ -70,7 +107,6 @@ def spline_interpolate(Z, num_x_bins, kx=3, s=0.1):
     
     #ToDo: add batch dimension to Z in order to substitute the for loop in qptransform linear for 1d interpolation with a single tensor operation thus exploiting GPU
 
-    #ToDo: check that everything is consistent with the use of GPU (i.e. add .to(Z.device) where needed)
     
     # Empty cache
     try:
@@ -80,18 +116,37 @@ def spline_interpolate(Z, num_x_bins, kx=3, s=0.1):
         pass
     nx_points = Z.shape[0]
     
-    x = torch.linspace(-1, 1, nx_points)
+    if xin==None:
+        x = torch.linspace(-1, 1, nx_points)
+    else:
+        x= xin
 
     #compute bspline coefficients
     coef, tx = spline_fit_natural_torch(x, Z, kx, s)
 
     #inerpolate
-    x_eval = torch.linspace(-1, 1, num_x_bins)
+    if xout==None:
+        x_eval = torch.linspace(-1, 1, num_x_bins)
+    else:
+        x_eval=xout
+        
     Z_interp = evaluate_spline_torch(x_eval, coef, tx, kx).view(num_x_bins)
     return Z_interp
 
 
 #----------------------------------------------------------------------
+def map_to_range(tensor, new_min=-1, new_max=1):
+    tensor_min = tensor.min()
+    tensor_max = tensor.max()
+
+    # Normalize to [0, 1]
+    normalized_tensor = (tensor - tensor_min) / (tensor_max - tensor_min)
+
+    # Scale to [new_min, new_max]
+    scaled_tensor = normalized_tensor * (new_max - new_min) + new_min
+
+    return scaled_tensor
+
 #Funcitons for spline computations
 def generate_natural_knots(x, k):
     """

@@ -45,6 +45,7 @@ class QTile(torch.nn.Module):
         duration: float,
         sample_rate: float,
         mismatch: float,
+        logf: bool = False,
     ):
         super().__init__()
         self.mismatch = mismatch
@@ -54,6 +55,7 @@ class QTile(torch.nn.Module):
         self.frequency = frequency
         self.duration = duration
         self.sample_rate = sample_rate
+        self.logf = logf
 
         self.windowsize = (
             2 * int(self.frequency / self.qprime * self.duration) + 1
@@ -177,6 +179,7 @@ class SingleQTransform(torch.nn.Module):
         q: float = 12,
         frange: List[float] = [0, torch.inf],
         mismatch: float = 0.2,
+        logf: bool = False,
     ):
         super().__init__()
         self.q = q
@@ -184,6 +187,7 @@ class SingleQTransform(torch.nn.Module):
         self.frange = frange
         self.duration = duration
         self.mismatch = mismatch
+        self.logf= logf
 
         qprime = self.q / 11 ** (1 / 2.0)
         if self.frange[0] <= 0:  # set non-zero lower frequency
@@ -272,41 +276,38 @@ class SingleQTransform(torch.nn.Module):
         X = torch.fft.rfft(X, norm="forward")
         X[..., 1:] *= 2
         self.qtiles = [qtile(X, norm) for qtile in self.qtile_transforms]
-
+    
     def interpolate(self, num_f_bins, num_t_bins, device):
+
         if self.qtiles is None:
             raise RuntimeError(
                 "Q-tiles must first be computed with .compute_qtiles()"
             )
 
-         
-        #Uncomment to return only qtiles. Needed to test 1D interpolation
-        #print('Returning Qtiles!!')
-        #return self.qtiles
+        xout = torch.arange(0.0,0.0+self.duration, step=self.duration / num_t_bins)
         
-        
-
-        # Extract time values
-        t = torch.linspace(0, 1, num_t_bins).to(device)
-        
-        print("Number of time bins:", num_t_bins)
-        
-        #interpolate tiles to
-        x_bins=self.qtiles[-1].squeeze(0).squeeze(0).shape[0]
-        print(f'{x_bins=}')
         # Interpolate along the time dimension using natural cubic spline
         resampled=[]
 
         #ToDO: Tensorize the following for loop. Pad each qtile to the size of the largest qtile and convert list to tensor using torch.stack. Then implement batch dimension in torch_spline_interpolation.spline_interpolate to pass the whole tensor at once.
         
         for qtile in self.qtiles:
-            NCS=spline_interpolate(qtile.squeeze(0).squeeze(0),num_t_bins,s=0.001)
+            xrow = torch.arange(0.0, (0.0 + self.duration), self.duration/qtile.shape[-1])
+            NCS=spline_interpolate(qtile.squeeze(0).squeeze(0),num_t_bins,s=0.001,xin=xrow,xout=xout)
             resampled.append(NCS)
             
         resampled = torch.stack(resampled, dim=-2)
         resampled = resampled.squeeze(-1).squeeze()
-        print(f'{resampled.shape=}')
-        resampled=spline_interpolate_2d(resampled.T,num_t_bins,num_f_bins,False,3,3,0.001,0.001)      
+
+        if self.logf:
+            yout = torch.tensor(numpy.geomspace(
+                self.frange[0],
+                self.frange[1],
+                num=num_f_bins,))
+        else:
+            yout = torch.arange(
+                self.frange[0], self.frange[1],(self.frange[1] - self.frange[0])/num_f_bins )
+        resampled=spline_interpolate_2d(resampled.T,num_t_bins,num_f_bins,logf=False,kx=3,ky=3,sx=0.001,sy=0.001,xin=xout,xout=xout,yin=self.freqs,yout=yout)      
 
         return resampled.to(device)
 
