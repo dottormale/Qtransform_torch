@@ -124,7 +124,8 @@ class QTile(torch.nn.Module):
         while len(fseries.shape) < 3:
             fseries = fseries[None]
 
-        windowed = fseries[..., self.indices] * self.window
+
+        windowed = fseries.to(self.indices.device)[..., self.indices] * self.window
         left, right = self.padding
         padded = F.pad(windowed, (int(left), int(right)), mode="constant")
         wenergy = torch.fft.ifftshift(padded, dim=-1)
@@ -291,13 +292,24 @@ class SingleQTransform(torch.nn.Module):
 
         #ToDO: Tensorize the following for loop. Pad each qtile to the size of the largest qtile and convert list to tensor using torch.stack. Then implement batch dimension in torch_spline_interpolation.spline_interpolate to pass the whole tensor at once.
         
+        #define NN for 1d interpolation
+        spline_interpolate=SplineInterpolate1D(num_t_bins).to(device)
+        
         for qtile in self.qtiles:
             xrow = torch.arange(0.0, (0.0 + self.duration), self.duration/qtile.shape[-1])
-            NCS=spline_interpolate(qtile.squeeze(0).squeeze(0),num_t_bins,s=0.001,xin=xrow,xout=xout)
-            resampled.append(NCS)
             
+            
+
+            #interpolate Qtile
+            NCS=spline_interpolate(Z=qtile.squeeze(0).squeeze(0),xin=xrow,xout=xout)
+            
+            resampled.append(NCS)
+        
+        #reshape result    
         resampled = torch.stack(resampled, dim=-2)
-        resampled = resampled.squeeze(-1).squeeze()
+        
+        #resampled = resampled.squeeze(-1).squeeze()
+        #print(f'After: {resampled.shape=}')
 
         if self.logf:
             yout = torch.tensor(numpy.geomspace(
@@ -307,7 +319,12 @@ class SingleQTransform(torch.nn.Module):
         else:
             yout = torch.arange(
                 self.frange[0], self.frange[1],(self.frange[1] - self.frange[0])/num_f_bins )
-        resampled=spline_interpolate_2d(resampled.T,num_t_bins,num_f_bins,logf=False,kx=3,ky=3,sx=0.001,sy=0.001,xin=xout,xout=xout,yin=self.freqs,yout=yout)      
+        
+        #define NN for 2d interpolation
+        spline_interpolate_2d=SplineInterpolate2D(num_t_bins=num_t_bins, num_f_bins=num_f_bins,logf=self.logf,frange=self.frange).to(device)
+
+        #interpolate Qtransform
+        resampled=spline_interpolate_2d(resampled.transpose(1, 2),xin=xout,xout=xout,yin=self.freqs,yout=yout)      
 
         return resampled.to(device)
 
