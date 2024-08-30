@@ -3,10 +3,11 @@
 This repository contains implementations for cubic spline interpolation using PyTorch. The primary components include:
 
 1. `Cubic_Spline_Interpolation.ipynb`: A Jupyter notebook demonstrating the usage and implementation of cubic spline interpolation.
-2. `torch_spline_interpolation.py`: A Python module providing functions for 1D and 2D spline interpolation.
-3. `qptransformlinear.py`: A Python module for Q-transform linear interpolation using PyTorch.
-4. `qtransform.py`: integration of https://github.com/ML4GW/ml4gw/blob/dev/ml4gw/transforms/qtransform.py with `torch_spline_interpolation.py`
-5. `torch_smoothing_spline_interpolation.py`: A Python module for smoothing spline interpolation using PyTorch.
+2. `GPU_qtransform_benchmark.ipynb`: A jupyter notebook to test inputs with batch dimenions for interpolation and for speed benchmarking the qtransform against gwpy's qtransform on batched input.
+3. `torch_spline_interpolation.py`: A Python module providing functions for 1D and 2D spline interpolation.
+4. `qptransformlinear.py`: A Python module for Q-transform linear interpolation using PyTorch.
+5. `qtransform.py`: integration of https://github.com/ML4GW/ml4gw/blob/dev/ml4gw/transforms/qtransform.py with `torch_spline_interpolation.py`
+6. `torch_smoothing_spline_interpolation.py`: A Python module for smoothing spline interpolation using PyTorch.
 
 ## Table of Contents
 
@@ -16,6 +17,7 @@ This repository contains implementations for cubic spline interpolation using Py
   - [Python Modules](#python-modules)
 - [File Descriptions](#file-descriptions)
   - [Cubic_Spline_Interpolation.ipynb](#cubic_spline_interpolationipynb)
+  - [GPU_qtransform_benchmark.ipynb](#GPU_qtransform_benchmarkipynb)
   - [torch_spline_interpolation.py](#torch_spline_interpolationpy)
   - [qptransformlinear.py](#qptransformlinearpy)
   - [qtransform.py](#qtransformpy)
@@ -84,6 +86,15 @@ The Jupyter notebook contains several sections demonstrating different aspects o
 - **GWs Qplots Interpolation**: Applying the interpolation methods to spectrograms and comparing with `gwpy.q_transform()`.
 - **Smoothing Spline (Addressing Border Effects in 1D Interpolation)**: Analysis of different 1D interpolation methods using cubic splines and addressing border effects.
 
+### GPU_qtransform_benchmark.ipynb
+
+The Jupyter notebook contains several sections demonstrating different aspects of cubic spline interpolation:
+
+- **Set GPU**: Setup for running the notebook on a GPU.
+- **Load data**: Load open data from interferometer of choice and organise it in batches.
+- **Test transform with interpolation**: Speed benchmark of custom torch based qtransform against gwpy's on batched input.
+- **Test interpolation**: Test custom torch based 1D and 2D spline interpolation on batched input
+  
 ### torch_spline_interpolation.py
 
 This module provides functions for performing cubic spline interpolation in 1D and 2D using PyTorch:
