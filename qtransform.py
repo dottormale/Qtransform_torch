@@ -3,7 +3,10 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+
 from torch_spline_interpolation import *
+from torch_spline_interpolation_1d_batch import *
+
 
 """
 All based on https://github.com/gwpy/gwpy/blob/v3.0.8/gwpy/signal/qtransform.py
@@ -181,6 +184,7 @@ class SingleQTransform(torch.nn.Module):
         frange: List[float] = [0, torch.inf],
         mismatch: float = 0.2,
         logf: bool = False,
+        qtiles_mode=False,
     ):
         super().__init__()
         self.q = q
@@ -189,6 +193,7 @@ class SingleQTransform(torch.nn.Module):
         self.duration = duration
         self.mismatch = mismatch
         self.logf= logf
+        self.qtiles_mode=qtiles_mode # Allow for Qtile computation only (no interpolation). Very useful for ML applications!
 
         qprime = self.q / 11 ** (1 / 2.0)
         if self.frange[0] <= 0:  # set non-zero lower frequency
@@ -288,29 +293,15 @@ class SingleQTransform(torch.nn.Module):
         xout = torch.arange(0.0,0.0+self.duration, step=self.duration / num_t_bins)
         
         # Interpolate along the time dimension using natural cubic spline
-        resampled=[]
 
-        #ToDO: Tensorize the following for loop. Pad each qtile to the size of the largest qtile and convert list to tensor using torch.stack. Then implement batch dimension in torch_spline_interpolation.spline_interpolate to pass the whole tensor at once.
-        
         #define NN for 1d interpolation
-        spline_interpolate=SplineInterpolate1D(num_t_bins).to(device)
-        
-        for qtile in self.qtiles:
-            xrow = torch.arange(0.0, (0.0 + self.duration), self.duration/qtile.shape[-1])
-            
-            
 
-            #interpolate Qtile
-            NCS=spline_interpolate(Z=qtile.squeeze(0).squeeze(0),xin=xrow,xout=xout)
-            
-            resampled.append(NCS)
+        spline_interpolate_batch=SplineInterpolate1D_batch(num_t_bins).to(device)
         
-        #reshape result    
-        resampled = torch.stack(resampled, dim=-2)
+        #perfrom 1d spline interpolation in batches
+        time_interp_tiles=spline_interpolate_batch(Z=self.qtiles,xmin=0.0,xmax=self.duration,xout=xout)
         
-        #resampled = resampled.squeeze(-1).squeeze()
-        #print(f'After: {resampled.shape=}')
-
+        #Inteprolate along both the time and frequency dimension using natural bicubic spline
         if self.logf:
             yout = torch.tensor(numpy.geomspace(
                 self.frange[0],
@@ -324,7 +315,7 @@ class SingleQTransform(torch.nn.Module):
         spline_interpolate_2d=SplineInterpolate2D(num_t_bins=num_t_bins, num_f_bins=num_f_bins,logf=self.logf,frange=self.frange).to(device)
 
         #interpolate Qtransform
-        resampled=spline_interpolate_2d(resampled.transpose(1, 2),xin=xout,xout=xout,yin=self.freqs,yout=yout)      
+        resampled=spline_interpolate_2d(time_interp_tiles.transpose(1, 2),xin=xout,xout=xout,yin=self.freqs,yout=yout)      
 
         return resampled.to(device)
 
@@ -363,6 +354,10 @@ class SingleQTransform(torch.nn.Module):
             spectrogram_shape = self.spectrogram_shape
         num_f_bins, num_t_bins = spectrogram_shape
         self.compute_qtiles(X, norm)
+        
+        # Allow for Qtile computation only. Very useul in many ML applications!
+        if self.qtiles_mode:
+            return self.qtiles 
         return self.interpolate(num_f_bins, num_t_bins,X.device)
 
 
