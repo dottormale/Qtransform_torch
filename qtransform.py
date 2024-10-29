@@ -8,6 +8,15 @@ from torch_spline_interpolation import *
 from torch_spline_interpolation_1d_batch import *
 
 
+#UNCOMMENT WHEN DEBUGGING
+# Reload the module 
+#import importlib
+#import sys
+#importlib.reload(sys.modules['torch_spline_interpolation_delta'])
+#importlib.reload(sys.modules['torch_spline_interpolation_beta'])
+
+
+
 """
 All based on https://github.com/gwpy/gwpy/blob/v3.0.8/gwpy/signal/qtransform.py
 The methods, names, and descriptions come almost entirely from GWpy.
@@ -299,6 +308,7 @@ class SingleQTransform(torch.nn.Module):
         spline_interpolate_batch=SplineInterpolate1D_batch(num_t_bins).to(device)
         
         #perfrom 1d spline interpolation in batches
+        
         time_interp_tiles=spline_interpolate_batch(Z=self.qtiles,xmin=0.0,xmax=self.duration,xout=xout)
         
         #Inteprolate along both the time and frequency dimension using natural bicubic spline
@@ -311,11 +321,12 @@ class SingleQTransform(torch.nn.Module):
             yout = torch.arange(
                 self.frange[0], self.frange[1],(self.frange[1] - self.frange[0])/num_f_bins )
         
+
         #define NN for 2d interpolation
         spline_interpolate_2d=SplineInterpolate2D(num_t_bins=num_t_bins, num_f_bins=num_f_bins,logf=self.logf,frange=self.frange).to(device)
 
         #interpolate Qtransform
-        resampled=spline_interpolate_2d(time_interp_tiles.transpose(1, 2),xin=xout,xout=xout,yin=self.freqs,yout=yout)      
+        resampled=spline_interpolate_2d(time_interp_tiles.transpose(2,3),xin=xout,xout=xout,yin=self.freqs,yout=yout)    
 
         return resampled.to(device)
 
