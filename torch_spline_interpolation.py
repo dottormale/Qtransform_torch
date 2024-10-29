@@ -23,8 +23,8 @@ class SplineInterpolate1D(nn.Module):
         
         self.device=Z.device
         
-        while len(Z.shape)<2:
-           print('Adding batch dimension...')
+        while len(Z.shape)<3:
+           print('Adding batch and/or channel dimension dimension...')
            Z=Z.unsqueeze(0) 
 
         nx_points = Z.shape[-1]
@@ -219,12 +219,12 @@ class SplineInterpolate1D(nn.Module):
       """
     
         # Compute B-spline basis functions
-        bx = self.bspline_basis_natural_torch(x, kx, tx).to(self.device)  # (n, m)
+        bx = self.bspline_basis_natural_torch(x, kx, tx).to(self.device)  
         
-        # Expand bx to allow batch computation: (1, n, m)
-        bx = bx.unsqueeze(0)  # (1, n, m)
+        # Expand bx to allow batch computation:
+        bx = bx.unsqueeze(0)  
     
-        # Perform batched matrix multiplication: (batch_size, n, m) @ (batch_size, m, 1) -> (batch_size, n)
+        # Perform batched matrix multiplication: 
         z_eval = (bx @ coef.unsqueeze(-1)).squeeze(-1)
         
         return z_eval
@@ -248,11 +248,11 @@ class SplineInterpolate2D(nn.Module):
 
         self.device=Z.device
         
-        while len(Z.shape)<3:
-           print('Adding batch dimension...')
+        while len(Z.shape)<4:
+           print('Adding batch or channel dimension...')
            Z=Z.unsqueeze(0) 
         
-        batch_size, nx_points, ny_points = Z.shape[0], Z.shape[-2], Z.shape[-1]
+        batch_size,channel_size, nx_points, ny_points = Z.shape[0],  Z.shape[1], Z.shape[-2], Z.shape[-1]
 
         if xin is None:
             x = torch.linspace(-1, 1, nx_points, device=self.device)
@@ -346,23 +346,27 @@ class SplineInterpolate2D(nn.Module):
 
     def bivariate_spline_fit_natural_torch(self, x, y, z, kx, ky, sx, sy):
         tx = self.generate_natural_knots(x, kx)
+
         ty = self.generate_natural_knots(y, ky)
+
 
         Bx = self.bspline_basis_natural_torch(x, kx, tx).to(self.device)
         By = self.bspline_basis_natural_torch(y, ky, ty).to(self.device)
+        
+
 
         mx = Bx.size(1)
         my = By.size(1)
         Ix = torch.eye(mx, device=self.device)
         Iy = torch.eye(my, device=self.device)
-
+        
         # Adding batch dimension handling
-        ByT_By = By.T @ By + sy * Iy  # (my, my)
-        ByT_Z_Bx = torch.einsum('ij,bjk->bik', By.T, z.transpose(1, 2)) @ Bx  # (batch_size, my, mx)
-        E = torch.linalg.solve(ByT_By, ByT_Z_Bx)  # (batch_size, my, mx)
+        ByT_By = By.T.unsqueeze(0).unsqueeze(0) @ By.unsqueeze(0).unsqueeze(0) + (sy * Iy).unsqueeze(0).unsqueeze(0) 
+        ByT_Z_Bx =  By.T.unsqueeze(0).unsqueeze(0)@ z.transpose(2,3) @ Bx.unsqueeze(0).unsqueeze(0)  
+        E = torch.linalg.solve(ByT_By, ByT_Z_Bx) 
 
-        BxT_Bx = Bx.T @ Bx + sx * Ix  # (mx, mx)
-        C = torch.linalg.solve(BxT_Bx, E.transpose(1, 2)).transpose(1, 2)  # (batch_size, mx, my)
+        BxT_Bx = Bx.T.unsqueeze(0).unsqueeze(0) @ Bx.unsqueeze(0).unsqueeze(0) + (sx * Ix).unsqueeze(0).unsqueeze(0)  
+        C = torch.linalg.solve(BxT_Bx, E.transpose(2,3))
 
         return C.to(self.device), tx, ty
         
@@ -382,15 +386,11 @@ class SplineInterpolate2D(nn.Module):
         Returns:
             Z_interp: Interpolated values at the grid points.
         """
-        Bx = self.bspline_basis_natural_torch(x, kx, tx).unsqueeze(0).to(self.device)  # (1, num_x_eval_points, mx)
-        By = self.bspline_basis_natural_torch(y, ky, ty).unsqueeze(0).to(self.device)  # (1, num_y_eval_points, my)
-        
-        # Transpose By to match dimensions correctly
-        Bx = Bx.transpose(1, 2)  # (1, mx, num_x_eval_points)
-
-        
+        Bx = self.bspline_basis_natural_torch(x, kx, tx).unsqueeze(0).unsqueeze(0).to(self.device)  
+        By = self.bspline_basis_natural_torch(y, ky, ty).unsqueeze(0).unsqueeze(0).to(self.device)  
+            
         # Perform matrix multiplication using einsum to get Z_interp
-        Z_interp = torch.einsum('bik,bkm,bmj->bij', By, C, Bx)
+        Z_interp = By @ C.transpose(2,3) @ Bx.transpose(2,3)
         
         return Z_interp
 
@@ -411,4 +411,5 @@ class SplineInterpolate2D(nn.Module):
         Z_interp = torch.einsum('bnm,bmp,bpq->bnq', Bx, C, By.transpose(1, 2))
         return Z_interp
     '''
+
 
