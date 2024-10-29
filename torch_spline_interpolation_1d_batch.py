@@ -32,10 +32,11 @@ class SplineInterpolate1D_batch(nn.Module):
             
             #1. convert input to batched tensor and calculate batched knot vectors
             x_batched,t_batched,Z_batched=self.process_list_input(Z,xmin,xmax)       
-            
+            #print(f'{Z_batched.shape=}')
             
             #2. Compute batched Bspline basis functions
             Bx=self.bspline_basis_natural_torch_gamma(x_batched, self.kx, t_batched)
+            #print(f'{Bx.shape=}')
         
             #3. Compute batched spline coefficients
             coef = self.spline_fit_natural_torch_gamma(x_batched,t_batched, Z_batched,Bx ,self.kx, self.s)
@@ -49,10 +50,14 @@ class SplineInterpolate1D_batch(nn.Module):
             #5. Interpolate batched input
             Z_interp = self.evaluate_spline_torch_gamma(x_eval, coef, t_batched, self.kx)#.view(-1, self.num_x_bins)
             
+            #print(f'{Z_interp.shape=}')
+            
             #6. Filter the tensor to keep only non-zero subtensors, i.e. undo batch padding
             non_zero_mask =(Z_interp != 0).any(dim=-1)
+            #print(f'{non_zero_mask.shape=}')
 
-            filtered_tensor = Z_interp[non_zero_mask].view(Z_batched.shape[2],-1, self.num_x_bins)
+            filtered_tensor = Z_interp[non_zero_mask].view(Z_batched.shape[2],Z_batched.shape[3],-1, self.num_x_bins)
+            #print(f'{filtered_tensor.shape=}')
 
 
 
@@ -79,7 +84,17 @@ class SplineInterpolate1D_batch(nn.Module):
         
         # Get lengths and batch size
         lengths = [tensor.shape[-1] for tensor in Z]  
-        batch_size_ts=Z[0].shape[-2]
+        
+        if Z[0].shape[0]==1:
+            Z=[tensor.transpose(0,1) for tensor in Z]
+        
+            
+        batch_size_ts=Z[0].shape[0]
+        
+        channel_size_ts=Z[0].shape[1]
+        
+        
+        
         
                     
         # Use OrderedDict to maintain order and count occurrences in one pass
@@ -100,8 +115,8 @@ class SplineInterpolate1D_batch(nn.Module):
         batch_size_qtile_max=max(length_counts.values())
         
         # Preallocate tensor for padded input
-        z_padded = torch.zeros((len(unique_lengths),batch_size_qtile_max, batch_size_ts,max_length_z), device=self.device)
-        
+        z_padded = torch.zeros((len(unique_lengths),batch_size_qtile_max,batch_size_ts,channel_size_ts,max_length_z), device=self.device)
+        #print(f'{z_padded.shape=}')
 
         x_list, t_list = [], []
         
@@ -114,7 +129,7 @@ class SplineInterpolate1D_batch(nn.Module):
             # Fill preallocated tensor with input data. the resulting tensor will be padded with zeros
             for i, tensor in enumerate(same_length_tensors):
                 
-                z_padded[j, i,:,:tensor.shape[-1]] = tensor  # Fill with original tensor
+                z_padded[j, i,:,:,:tensor.shape[-1]] = tensor  # Fill with original tensor
 
             # Create x and t for this length
             x = torch.arange(xmin, xmax, (xmax-xmin)/length, device=self.device)  # Create x tensor
@@ -280,7 +295,6 @@ class SplineInterpolate1D_batch(nn.Module):
           coef: A 1D tensor representing the B-spline coefficients.
           tx: A 1D tensor representing the knot positions for the B-spline.
       """
-        print(f'{bx.shape=}')
     
         #add regularizing term
         m = bx.size(2)
@@ -292,12 +306,16 @@ class SplineInterpolate1D_batch(nn.Module):
     
         # Compute B_T_B and B_T_z for each batch
         
-        B_T_B = bx.unsqueeze(1).transpose(-2, -1) @ bx.unsqueeze(1) + s * I  
+        B_T_B = bx.unsqueeze(1).unsqueeze(1).transpose(-2, -1) @ bx.unsqueeze(1).unsqueeze(1) + (s * I).unsqueeze(0).unsqueeze(0)  
 
-        B_T_z = bx.unsqueeze(1).transpose(-2, -1) @ z.permute(0,2,3,1) 
+        B_T_z = bx.unsqueeze(1).unsqueeze(1).transpose(-2, -1) @ z.permute(0,2,3,4,1) 
+        
+        
+       
     
         # Solve the linear system for each batch
-        coef = torch.linalg.solve(B_T_B.expand(z.size(0), -1, -1,-1), B_T_z).squeeze(-1)
+        coef = torch.linalg.solve(B_T_B, B_T_z).squeeze(-1) #B_T_B.expand(z.size(0), -1,-1, -1,-1)
+
         
         return coef.to(z.device)
     
@@ -320,9 +338,10 @@ class SplineInterpolate1D_batch(nn.Module):
         bx = self.bspline_basis_natural_torch_gamma(x, kx, tx).to(self.device)  
         
         # Expand bx to allow batch computation
-        bx = bx.unsqueeze(1)  
+        bx = bx.unsqueeze(1).unsqueeze(1)  
+        
 
         # Perform batched matrix multiplication: 
-        z_eval = torch.matmul(bx, coef.permute(0,3,2,1))
-        
-        return z_eval.permute(3,0,1,2)
+        z_eval = torch.matmul(bx, coef) #.permute(0,1,3,2)
+
+        return z_eval.permute(1,2,0,4,3)
