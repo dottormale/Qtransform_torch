@@ -8,6 +8,8 @@ This repository contains implementations for cubic spline interpolation using Py
 4. `qptransformlinear.py`: A Python module for Q-transform linear interpolation using PyTorch.
 5. `qtransform.py`: integration of https://github.com/ML4GW/ml4gw/blob/dev/ml4gw/transforms/qtransform.py with `torch_spline_interpolation.py`
 6. `torch_smoothing_spline_interpolation.py`: A Python module for smoothing spline interpolation using PyTorch.
+7. 'torch_spline_interpolation_1d_batch.py': A python module that allows for batched version of 1d spline interpolation
+8. 'Pytorch_Qtransform_example_usage.ipynb': A jupyter notebook with example usages of pytorch based Qtransform. It requires 3,5,7.
 
 ## Table of Contents
 
