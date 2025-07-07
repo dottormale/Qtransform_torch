@@ -10,6 +10,7 @@ This repository contains implementations for cubic spline interpolation using Py
 6. `torch_smoothing_spline_interpolation.py`: A Python module for smoothing spline interpolation using PyTorch.
 7. 'torch_spline_interpolation_1d_batch.py': A python module that allows for batched version of 1d spline interpolation
 8. 'Pytorch_Qtransform_example_usage.ipynb': A jupyter notebook with example usages of pytorch based Qtransform. It requires 3,5,7.
+9. 'Interpolation_tests.ipynb': A jupyter notebook demonstrating the usage of torch based 1d and 2d spline interpolation methods in comparison to scipy's.
 
 ## Table of Contents
 
@@ -21,6 +22,7 @@ This repository contains implementations for cubic spline interpolation using Py
   - [Cubic_Spline_Interpolation.ipynb](#cubic_spline_interpolationipynb)
   - [GPU_qtransform_benchmark.ipynb](#GPU_qtransform_benchmarkipynb)
   - [torch_spline_interpolation.py](#torch_spline_interpolationpy)
+  - [Interpolation_test.ipynb](https://github.com/dottormale/Qtransform_torch/blob/main/Interpolation_test.ipynb)
   - [qptransformlinear.py](#qptransformlinearpy)
   - [qtransform.py](#qtransformpy)
   - [torch_smoothing_spline_interpolation.py](#torch_smoothing_spline_interpolationpy)
@@ -96,6 +98,9 @@ The Jupyter notebook contains several sections demonstrating different aspects o
 - **Load data**: Load open data from interferometer of choice and organise it in batches.
 - **Test transform with interpolation**: Speed benchmark of custom torch based qtransform against gwpy's on batched input.
 - **Test interpolation**: Test custom torch based 1D and 2D spline interpolation on batched input
+
+### Interpolation_tests.ipynb
+The jupyter notebook contains a comparison between torch based and scipy's native 1D and 2D spline interpolation methods.
   
 ### torch_spline_interpolation.py
 
