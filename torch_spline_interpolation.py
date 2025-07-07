@@ -13,7 +13,7 @@ import numpy as np
 
 # Spline interpolation for 1D
 class SplineInterpolate1D(nn.Module):
-    def __init__(self, num_x_bins, kx=3, s=0.001):
+    def __init__(self, num_x_bins, kx=3, s=0.0):
         super().__init__()
         self.num_x_bins = num_x_bins
         self.kx = kx
@@ -23,7 +23,7 @@ class SplineInterpolate1D(nn.Module):
         
         self.device=Z.device
         
-        while len(Z.shape)<3:
+        while len(Z.shape)<4:
            print('Adding batch and/or channel dimension dimension...')
            Z=Z.unsqueeze(0) 
 
@@ -42,28 +42,48 @@ class SplineInterpolate1D(nn.Module):
         else:
             x_eval = xout.to(self.device)
 
-        Z_interp = self.evaluate_spline_torch(x_eval, coef, tx, self.kx).view(-1, self.num_x_bins)
+        Z_interp = self.evaluate_spline_torch(x_eval, coef, tx, self.kx)#.view(-1, self.num_x_bins)
+        
+        print(f'{Z_interp.shape=}')
+        
         return Z_interp
         
-    def generate_natural_knots(self,x, k):
-        """
-        Generates a natural knot sequence for B-spline interpolation.
-        Natural knot sequence means that 2*k knots are added to the beginning and end of datapoints as replicas of first and last datapoint respectively in order to enforce natural boundary conditions, i.e. second derivative =0.
-        the other n nodes are placed in correspondece of thedata points.
     
-        Args:
-            x: Tensor of data point positions.
-            k: Degree of the spline.
-    
-        Returns:
-            Tensor of knot positions.
+    def generate_fitpack_knots(self, x: torch.Tensor, k: int) -> torch.Tensor:
         """
-        n = x.shape[0]
-        t = torch.zeros(n + 2 * k, device=self.device)
-        t[:k] = x[0]
-        t[k:-k] = x
-        t[-k:] = x[-1]
-        return t
+        Compute knots placement like FITPACK for spline degree k, given data points x.
+        x: 1D tensor of increasing data points, length n
+        Returns knot vector of length n + k + 1
+        """
+        if x.ndim == 1:
+            x = x.unsqueeze(0)  # batch dim
+        x=x.double()
+        B, n = x.shape
+        if n < k + 1:
+            raise ValueError(f"Need at least {k + 1} points for degree k={k}.")
+
+        # Number of knots
+        m = n + k + 1
+
+        # Boundary knots: repeat boundary points k+1 times
+        left = x[:, 0:1].expand(B, k+1)
+        right = x[:, -1:].expand(B, k+1)
+
+        # Interior knots: average of k consecutive points **starting at i+1**
+        # Number of interior knots = m - 2*(k+1) = n - k - 1
+        # i ranges from 0 to n-k-2 (total n-k-1 knots)
+        interior_knots = torch.stack(
+            [x[:, i+1:i + k + 1].mean(dim=1) for i in range(n - k - 1)],
+            dim=1
+        ) if (n - k - 1) > 0 else torch.empty(B, 0, device=x.device, dtype=x.dtype)
+
+        # Concatenate all knots
+        knots = torch.cat([left, interior_knots, right], dim=1)
+
+        # Remove batch dim if originally 1D
+        return knots.squeeze(0) if knots.shape[0] == 1 else knots
+    
+
     
     def compute_L_R(self, x, t, d, m, k):
         
@@ -178,7 +198,7 @@ class SplineInterpolate1D(nn.Module):
       """
     
         #generate natural knots
-        tx = self.generate_natural_knots(x, kx)
+        tx= self.generate_fitpack_knots(x,kx)    #new generation matching scipy (fitpack)
     
         #compute basis functions
         bx = self.bspline_basis_natural_torch(x, kx, tx).to(self.device)
@@ -191,17 +211,30 @@ class SplineInterpolate1D(nn.Module):
         z = z.float()
         bx = bx.float()
     
-        # Expand bx to have a batch dimension: (1, n, m)
-        bx = bx.unsqueeze(0)  # (1, n, m)
+        #print(f'{bx.shape=}')
+        #print(f'{z.shape=}')
     
-        # Compute B_T_B and B_T_z for each batch
-        B_T_B = bx.transpose(1, 2) @ bx + s * I  # (1, m, m)
-        B_T_z = bx.transpose(1, 2) @ z.unsqueeze(-1)  # (batch_size, m, 1)
-    
-        # Solve the linear system for each batch
-        coef = torch.linalg.solve(B_T_B.expand(z.size(0), -1, -1), B_T_z).squeeze(-1)
+        # Compute BTB matrix
+        B_T_B = torch.einsum("mt,tn->mn", bx.mT, bx)  # [M, M]
+
+        # Optional regularization
+        if self.s > 0:
+            print(f'adding regularization to solver: {s=}')
+            B_T_B += self.s * torch.eye(B_T_B.shape[0], device=z.device)
+
+        # Compute B^T @ z for each group/batch/channel:
+        # Result: [G, B, C, M]
+        B_T_z = torch.einsum("...mt,...t->...m", bx.mT, z)
+        #print(f'{B_T_z.shape=}')
+        #print(f'{B_T_B.shape=}')
+        # Solve: (B_T_B @ coef) = B_T_z  → for each (g,b,c)
+        # Output shape: [G, B, C, m]
+        coef = torch.linalg.solve(B_T_B, B_T_z.unsqueeze(-1))
+        #print(f'{coef.shape=}')
         
+
         return coef.to(z.device), tx
+
     
 
     def evaluate_spline_torch(self, x, coef, tx, kx):
@@ -221,19 +254,18 @@ class SplineInterpolate1D(nn.Module):
         # Compute B-spline basis functions
         bx = self.bspline_basis_natural_torch(x, kx, tx).to(self.device)  
         
-        # Expand bx to allow batch computation:
-        bx = bx.unsqueeze(0)  
-    
-        # Perform batched matrix multiplication: 
-        z_eval = (bx @ coef.unsqueeze(-1)).squeeze(-1)
         
+        z_eval = torch.einsum("tm,...ml->...tl", bx, coef).squeeze(-1)
+
+
         return z_eval
+        
 #---------------------------------------------------------------------
 
 #2D
 
 class SplineInterpolate2D(nn.Module):
-    def __init__(self, num_t_bins, num_f_bins, kx=3, ky=3, sx=0.001, sy=0.001, logf=False, frange=(10, 100)):
+    def __init__(self, num_t_bins, num_f_bins, kx=3, ky=3, sx=0.0, sy=0.0, logf=False, frange=(8, 500)):
         super().__init__()
         self.num_t_bins = num_t_bins
         self.num_f_bins = num_f_bins
@@ -269,7 +301,7 @@ class SplineInterpolate2D(nn.Module):
         else:
             y = yin.to(self.device)
 
-        coef, tx, ty = self.bivariate_spline_fit_natural_torch(x, y, Z, self.kx, self.ky, self.sx, self.sy)
+        coef, tx, ty = self.bivariate_spline_fit_natural_torch(x.double(), y.double(), Z.double(), self.kx, self.ky, self.sx, self.sy)
 
         if xout is None:
             x_eval = torch.linspace(-1, 1, self.num_t_bins, device=self.device)
@@ -284,8 +316,8 @@ class SplineInterpolate2D(nn.Module):
         else:
             y_eval = yout.to(self.device)
 
-        Z_interp = self.evaluate_bivariate_spline_torch(x_eval, y_eval, coef, tx, ty, self.kx, self.ky)
-        return Z_interp
+        Z_interp = self.evaluate_bivariate_spline_torch_clamp(x_eval.double(), y_eval.double(), coef, tx, ty, self.kx, self.ky)
+        return Z_interp.permute(0,1,3,2)
 
     def generate_natural_knots(self, x, k):
         n = x.shape[0]
@@ -294,6 +326,97 @@ class SplineInterpolate2D(nn.Module):
         t[k:-k] = x
         t[-k:] = x[-1]
         return t
+    
+    def generate_fitpack_knots(self, x: torch.Tensor, k: int) -> torch.Tensor:
+        """
+        Compute knots placement like FITPACK for spline degree k, given data points x.
+        x: 1D tensor of increasing data points, length n
+        Returns knot vector of length n + k + 1
+        """
+        if x.ndim == 1:
+            x = x.unsqueeze(0)  # batch dim
+        
+        x=x.double()
+
+        B, n = x.shape
+        if n < k + 1:
+            raise ValueError(f"Need at least {k + 1} points for degree k={k}.")
+
+        # Number of knots
+        m = n + k + 1
+
+        # Boundary knots: repeat boundary points k+1 times
+        left = x[:, 0:1].expand(B, k+1)
+        right = x[:, -1:].expand(B, k+1)
+
+        # Interior knots: average of k consecutive points **starting at i+1**
+        # Number of interior knots = m - 2*(k+1) = n - k - 1
+        # i ranges from 0 to n-k-2 (total n-k-1 knots)
+        interior_knots = torch.stack(
+            [x[:, i+1:i + k + 1].mean(dim=1) for i in range(n - k - 1)],
+            dim=1
+        ) if (n - k - 1) > 0 else torch.empty(B, 0, device=x.device, dtype=x.dtype)
+
+        # Concatenate all knots
+        knots = torch.cat([left, interior_knots, right], dim=1)
+
+        # Remove batch dim if originally 1D
+        return knots.squeeze(0) if knots.shape[0] == 1 else knots
+    
+    def generate_fitpack_knots_refined(self, x: torch.Tensor, k: int, max_iter: int = 200, tol: float = 1e-30):
+        """
+        Native PyTorch emulation of FITPACK knot placement logic for interpolation (s=0).
+        This does not exactly replicate FITPACK but mimics its iterative refinement behavior.
+        Use it when logf=True, not needed otherwise
+
+        Args:
+            x (torch.Tensor): 1D tensor of increasing sorted values (len n)
+            k (int): Degree of B-spline
+            max_iter (int): Max number of refinement iterations
+            tol (float): Stop if max change in interior knots < tol
+
+        Returns:
+            torch.Tensor: Knot vector of length n + k + 1
+        """
+        x = x.double()
+        n = x.numel()
+        assert n > k + 1, "Need at least k+2 points for interpolation"
+
+        left = x[0].repeat(k + 1)
+        right = x[-1].repeat(k + 1)
+
+        m = n + k + 1
+        num_internal = m - 2*(k + 1)
+
+        if num_internal <= 0:
+            return torch.cat([left, right])
+
+        # Initial guess: Greville-like average of k points
+        interior = torch.stack([
+            x[i + 1:i + k + 1].mean() for i in range(n - k - 1)
+        ])
+
+        # Iterative refinement loop
+        for _ in range(max_iter):
+            # Pseudo residuals (distance to target "uniformized" locations)
+            dx = x[1:] - x[:-1]
+            weight = dx / dx.sum()
+            cumw = torch.cat([torch.zeros(1, dtype=x.dtype, device=x.device), weight.cumsum(0)])
+
+            target_interp = x[0] + (x[-1] - x[0]) * cumw[1:-1]
+            new_interior = torch.stack([
+                target_interp[i + k//2] for i in range(num_internal)
+            ])
+
+            diff = (new_interior - interior).abs().max()
+            interior = 0.5 * interior + 0.5 * new_interior
+
+            if diff < tol:
+                break
+
+        knots=torch.cat([left, interior, right])#.float()
+        # Remove batch dim if originally 1D
+        return knots.squeeze(0) if knots.shape[0] == 1 else knots
 
     def bspline_basis_natural_torch(self, x, k, t):
         n = x.shape[0]
@@ -314,7 +437,7 @@ class SplineInterpolate2D(nn.Module):
         return b[:, :, -1]
 
     def zeroth_order(self, x, k, t, n, m):
-        b = torch.zeros((n, m, k + 1), device=self.device)
+        b = torch.zeros((n, m, k + 1), device=self.device,dtype=torch.float64)
 
 
         mask_lower = t[:m+1].unsqueeze(0)[:, :-1] <= x.unsqueeze(1)
@@ -345,13 +468,28 @@ class SplineInterpolate2D(nn.Module):
         return L, R
 
     def bivariate_spline_fit_natural_torch(self, x, y, z, kx, ky, sx, sy):
-        tx = self.generate_natural_knots(x, kx)
-
-        ty = self.generate_natural_knots(y, ky)
-
+        
+        #tx = self.generate_natural_knots(x, kx) #old unifrom generation
+        tx = self.generate_fitpack_knots(x,kx)
+        
+        #ty = self.generate_natural_knots(y, ky) #old uniform generation
+        if self.logf:
+            ty = self.generate_fitpack_knots_refined(y,ky)
+        else:
+            ty = self.generate_fitpack_knots(y,ky)
+        
+        print(f'{tx.dtype=}')
+        print(f'{ty.dtype=}')
 
         Bx = self.bspline_basis_natural_torch(x, kx, tx).to(self.device)
         By = self.bspline_basis_natural_torch(y, ky, ty).to(self.device)
+        
+        print(f'{Bx.dtype=}')
+        print(f'{By.dtype=}')
+              
+        print(f'{z.dtype=}')
+        print(f'{x.dtype=}')
+        print(f'{y.dtype=}')
         
 
 
@@ -360,6 +498,7 @@ class SplineInterpolate2D(nn.Module):
         Ix = torch.eye(mx, device=self.device)
         Iy = torch.eye(my, device=self.device)
         
+        '''
         # Adding batch dimension handling
         ByT_By = By.T.unsqueeze(0).unsqueeze(0) @ By.unsqueeze(0).unsqueeze(0) + (sy * Iy).unsqueeze(0).unsqueeze(0) 
         ByT_Z_Bx =  By.T.unsqueeze(0).unsqueeze(0)@ z.transpose(2,3) @ Bx.unsqueeze(0).unsqueeze(0)  
@@ -369,6 +508,40 @@ class SplineInterpolate2D(nn.Module):
         C = torch.linalg.solve(BxT_Bx, E.transpose(2,3))
 
         return C.to(self.device), tx, ty
+        '''
+    
+    
+        # BxT_Bx: [mx, mx], ByT_By: [my, my]
+        BxT_Bx = Bx.T @ Bx 
+        if sx>0:
+            BxT_Bx += sx * Ix
+        ByT_By = By.T @ By 
+        if sy>0:
+            ByT_By += sy * Iy
+
+        # Step 1: Apply both basis matrices
+        '''
+        ByT_Z_Bx = torch.einsum("ij,bcik,kl->bcjl", By, z.transpose(-1,-2), Bx)
+        print(f'{ByT_Z_Bx.shape=}')
+
+        # Step 2: Solve along frequency axis
+        E = torch.linalg.solve(ByT_By, ByT_Z_Bx)   # shape: [B, C, my, mx]
+
+        # Step 3: Solve along time axis (after transpose)
+        C = torch.linalg.solve(BxT_Bx, E.mT).mT    # shape: [B, C, my, mx]
+
+        print(f'{C.shape=}')
+        '''
+        BxT_Z_By = torch.einsum("ij,bcik,kl->bcjl", Bx, z, By)
+        #BxT_Z_By = torch.einsum("tm,bcnf,fy->bcmy", Bx, z, By.T)
+        
+        # Step 2: solve along time axis
+        E = torch.linalg.solve(BxT_Bx.double(), BxT_Z_By.double())  # now shape [B, C, mx, my]
+
+        # Step 3: solve along freq axis
+        C = torch.linalg.solve(ByT_By.double(), E.mT).mT   # final shape: [B, C, mx, my]
+
+        return C, tx, ty
         
     def evaluate_bivariate_spline_torch(self, x, y, C, tx, ty, kx, ky):
         """
@@ -386,12 +559,51 @@ class SplineInterpolate2D(nn.Module):
         Returns:
             Z_interp: Interpolated values at the grid points.
         """
-        Bx = self.bspline_basis_natural_torch(x, kx, tx).unsqueeze(0).unsqueeze(0).to(self.device)  
-        By = self.bspline_basis_natural_torch(y, ky, ty).unsqueeze(0).unsqueeze(0).to(self.device)  
+        Bx = self.bspline_basis_natural_torch(x, kx, tx).to(self.device)  
+        By = self.bspline_basis_natural_torch(y, ky, ty).to(self.device)  
             
         # Perform matrix multiplication using einsum to get Z_interp
-        Z_interp = By @ C.transpose(2,3) @ Bx.transpose(2,3)
-        
+        '''
+        print(f'{By.shape=}')
+        print(f'{C.shape=}')
+        print(f'{Bx.mT.shape=}')
+        '''
+        Z_interp = torch.einsum("xk,bckm,my->bcxy", Bx, C, By.T)
+        return Z_interp
+    
+    def evaluate_bivariate_spline_torch_clamp(self, x, y, C, tx, ty, kx, ky):
+        """
+        Evaluate a bivariate spline on a grid of x and y points using clamped extrapolation,
+        mimicking SciPy's RectBivariateSpline behavior.
+
+        Args:
+            x: Tensor of x positions to evaluate the spline.
+            y: Tensor of y positions to evaluate the spline.
+            C: Coefficient tensor of shape (batch_size, mx, my).
+            tx: Knot positions for x (1D tensor).
+            ty: Knot positions for y (1D tensor).
+            kx: Degree of spline in x.
+            ky: Degree of spline in y.
+
+        Returns:
+            Z_interp: Interpolated values at the grid points.
+        """
+        # ✨ Clamp x and y to valid knot ranges (including boundaries)
+        x_min = tx[kx]
+        x_max = tx[-kx - 1]
+        y_min = ty[ky]
+        y_max = ty[-ky - 1]
+
+        x_clamped = torch.clamp(x, min=x_min, max=x_max)
+        y_clamped = torch.clamp(y, min=y_min, max=y_max)
+
+        # ✨ Compute basis functions on the clamped coordinates
+        Bx = self.bspline_basis_natural_torch(x_clamped, kx, tx).to(self.device)  # [x, kx]
+        By = self.bspline_basis_natural_torch(y_clamped, ky, ty).to(self.device)  # [y, ky]
+
+        # ✨ Evaluate spline via tensor contraction
+        Z_interp = torch.einsum("xk,bckm,my->bcxy", Bx, C, By.T)
+
         return Z_interp
 
         
