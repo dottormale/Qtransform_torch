@@ -606,22 +606,5 @@ class SplineInterpolate2D(nn.Module):
 
         return Z_interp
 
-        
-    '''def evaluate_bivariate_spline_torch_old(self, x, y, C, tx, ty, kx, ky):
-        Bx = self.bspline_basis_natural_torch(x, kx, tx)  # (num_x_eval_points, mx)
-        By = self.bspline_basis_natural_torch(y, ky, ty)  # (num_y_eval_points, my)
-        
-        # Bx: (num_x_eval_points, mx)
-        # By: (num_y_eval_points, my)
-        # C: (batch_size, mx, my)
-        
-        # Need to expand dimensions to handle batch correctly
-        Bx = Bx.unsqueeze(0)  # (1, num_x_eval_points, mx)
-        By = By.unsqueeze(0)  # (1, num_y_eval_points, my)
-        
-        # Performing batch-wise evaluation
-        Z_interp = torch.einsum('bnm,bmp,bpq->bnq', Bx, C, By.transpose(1, 2))
-        return Z_interp
-    '''
 
 
