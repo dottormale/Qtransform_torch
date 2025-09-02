@@ -599,7 +599,7 @@ class SingleQTransform(torch.nn.Module):
             #perfrom 1d spline interpolation in batches
             time_interp_phase_tiles=[]
             for qtile_phase_batch in Z_phase_list:
-                qtile_phase_batch_int= spline_interpolate_batch(Z=qtile_batch,xmin=0.0,xmax=self.duration,xout=xout)
+                qtile_phase_batch_int= spline_interpolate_1d(Z=qtile_batch,xmin=0.0,xmax=self.duration,xout=xout)
                 time_interp_phase_tiles.append(qtile_phase_batch_int)
 
             time_interp_phase_tiles=torch.cat(time_interp_phase_tiles,dim=0)
