@@ -552,7 +552,7 @@ class SingleQTransform(torch.nn.Module):
         s1d=time.time()
         for qtile_batch in Z_list:
             #print(f'{qtile_batch.shape=}')
-            xin = torch.linspace(0.0,6.0, steps=qtile_batch.shape[-1])
+            xin = torch.linspace(0.0,+self.duration, steps=qtile_batch.shape[-1])
             qtile_batch_int= spline_interpolate_1d(Z=qtile_batch,xin=xin,xout=xout)
             #print(f'{qtile_batch_int.shape=}')
             time_interp_tiles.append(qtile_batch_int)
