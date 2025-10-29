@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from gwpy.signal import filter_design
-from qtransform_gpu_2_2_0 import *
+from qtransform_gpu_2_5_0 import *
 from ml4gw.transforms import SpectralDensity,Whiten
 from  Peak_finder_torch import * 
 import gc
