@@ -138,6 +138,10 @@ This module provides functions for performing smoothing spline interpolation usi
 - Matplotlib
 - Jupyter Notebook
 
+## License
+Copyright (c) [2025] [Lorenzo Asprea].
+
+This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License v3.0 as published by the Free Software Foundation.
 ## Contributing
 
 Contributions are welcome! Please fork the repository and submit a pull request.
