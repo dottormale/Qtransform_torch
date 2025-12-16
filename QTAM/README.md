@@ -1,6 +1,6 @@
-# QTAM (Q-Transform with Amplitude Modulation)
+# QTAM (Q-Transform Amplitude Modulation)
 
-This folder contains a Jupyter Notebook which provides examples on how to use the **Q-Transform with Amplitude Modulation (QTAM)**, together with two Python scripts containing the QTAM class and other accessory classes and functions needed for the analysis of time series in the time-frequency space.
+This folder contains a Jupyter Notebook which provides examples on how to use the **Q-Transform Amplitude Modulation (QTAM)**, together with two Python scripts containing the QTAM class and other accessory classes and functions needed for the analysis of time series in the time-frequency space.
 
 ## 📥 Installation
 
