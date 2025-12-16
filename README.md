@@ -53,7 +53,7 @@ Located in the `Spline_interpolation/` folder, this subproject hosts code relate
 
 Both subprojects in this repository are open source and licensed under the **GNU General Public License v3.0**.
 
-**Copyright (c) 2025 Lorenzo Asprea.**
+**Copyright (c) 2024-2025 Lorenzo Asprea.**
 
 This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License v3.0 as published by the Free Software Foundation.
 
