@@ -16,3 +16,8 @@ Files Description
 
 - **glitch_for_testing.pkl**: file containig a 0.2 seconds long _Scattered Light_ glitch which is imported into QTAM_Example_Usage.ipynb to demontrate a de-noising application. 
 
+
+## LICENSE
+Copyright (c) [2025] [Lorenzo Asprea].
+
+This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License v3.0 as published by the Free Software Foundation.
