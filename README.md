@@ -14,12 +14,12 @@ cd Qtransform_torch
 
 The repository is organized into the following main subfolders:
 
-* **`QTAM/`**: Implementation of the Q-Transform with Amplitude Modulation for time-frequency analysis.
-* **`SPline_interpolation/`**: Code related to spline interpolation techniques.
+* **`/QTAM`**: Implementation of the Q-Transform with Amplitude Modulation for time-frequency analysis.
+* **`/Spline_interpolation`**: Code related to spline interpolation techniques.
 
 ---
 
-## 📂 Subproject: QTAM (Q-Transform with Amplitude Modulation)
+## 📂 Subproject: QTAM (Q-Transform Amplitude Modulation)
 
 Located in the `QTAM/` folder, this project contains the core implementation and examples for the Q-Transform with Amplitude Modulation (QTAM). This is an advanced method for analyzing time-series data in the time-frequency domain and is particularly useful for signals like Gravitational Waves (GWs).
 
@@ -41,11 +41,11 @@ The QTAM implementation is highly effective for tasks that require isolating tra
 
 ---
 
-## 📂 Subproject: SPline_interpolation
+## 📂 Subproject: Spline_interpolation
 
-Located in the `SPline_interpolation/` folder, this subproject hosts code related to general spline interpolation techniques.
+Located in the `Spline_interpolation/` folder, this subproject hosts code related to general spline interpolation techniques.
 
-> **ℹ️ Note:** Please refer to the `README.md` file inside the `SPline_interpolation/` subfolder for specific details on the files and usage instructions.
+> **ℹ️ Note:** Please refer to the `README.md` file inside the `Spline_interpolation/` subfolder for specific details on the files and usage instructions.
 
 ---
 
