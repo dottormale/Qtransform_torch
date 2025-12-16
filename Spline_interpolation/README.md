@@ -5,10 +5,9 @@ This repository contains implementations for cubic spline interpolation using Py
 1. `Cubic_Spline_Interpolation.ipynb`: A Jupyter notebook demonstrating the usage and implementation of cubic spline interpolation.
 2. `torch_spline_interpolation.py`: A Python module providing functions for 1D and 2D spline interpolation.
 3. `qptransformlinear.py`: A Python module for Q-transform linear interpolation using PyTorch.
-4. `qtransform.py`: integration of https://github.com/ML4GW/ml4gw/blob/dev/ml4gw/transforms/qtransform.py with `torch_spline_interpolation.py`
-5. `torch_smoothing_spline_interpolation.py`: A Python module for smoothing spline interpolation using PyTorch.
-6. 'torch_spline_interpolation_1d_batch.py': A python module that allows for batched version of 1d spline interpolation
-7. 'Interpolation_tests.ipynb': A jupyter notebook demonstrating the usage of torch based 1d and 2d spline interpolation methods in comparison to scipy's.
+4. `torch_smoothing_spline_interpolation.py`: A Python module for smoothing spline interpolation using PyTorch.
+5. 'torch_spline_interpolation_1d_batch.py': A python module that allows for batched version of 1d spline interpolation
+6. 'Interpolation_tests.ipynb': A jupyter notebook demonstrating the usage of torch based 1d and 2d spline interpolation methods in comparison to scipy's.
 
 ## Table of Contents
 
@@ -18,11 +17,8 @@ This repository contains implementations for cubic spline interpolation using Py
   - [Python Modules](#python-modules)
 - [File Descriptions](#file-descriptions)
   - [Cubic_Spline_Interpolation.ipynb](#cubic_spline_interpolationipynb)
-  - [GPU_qtransform_benchmark.ipynb](#GPU_qtransform_benchmarkipynb)
   - [torch_spline_interpolation.py](#torch_spline_interpolationpy)
   - [Interpolation_test.ipynb](https://github.com/dottormale/Qtransform_torch/blob/main/Interpolation_test.ipynb)
-  - [qptransformlinear.py](#qptransformlinearpy)
-  - [qtransform.py](#qtransformpy)
   - [torch_smoothing_spline_interpolation.py](#torch_smoothing_spline_interpolationpy)
 - [Dependencies](#dependencies)
 - [Contributing](#contributing)
@@ -99,19 +95,6 @@ This module provides functions for performing cubic spline interpolation in 1D a
 - `spline_interpolate(input_tensor, num_x_bins)`: Performs 1D cubic spline interpolation.
 - `spline_interpolate_2d(input_tensor, num_t_bins, num_f_bins)`: Performs 2D cubic spline interpolation.
 
-### qptransformlinear.py
-
-This module provides functionality for Q-transform linear interpolation using PyTorch:
-
-- `QScan`: Class for handling Q-scan operations.
-- `SingleQTransformLinear`: Class for performing single Q-transform linear interpolation.
-
-### qtransform.py
-
-This module provides functionality for Q-transform interpolation using PyTorch.
-The package is the same as 
-- https://github.com/ML4GW/ml4gw/blob/dev/ml4gw/transforms/qtransform.py
-with the only difference being the interpolation methods implemented in torch_spline_interpolation.py replacing pytorch's standart interpolation methods.
 
 ### torch_smoothing_spline_interpolation.py
 
