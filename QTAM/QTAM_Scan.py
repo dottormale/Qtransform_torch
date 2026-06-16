@@ -1,7 +1,9 @@
 import math
 from typing import List, Optional, Tuple, Union
+import warnings
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from torch_spline_interpolation_1_0_0 import *
@@ -9,23 +11,22 @@ import numpy as np
 import gc
 from collections import OrderedDict
 
+"""
+All based on https://github.com/gwpy/gwpy/blob/v3.0.8/gwpy/signal/qtransform.py
 
+Vectorized multi-configuration variant (QTileMulti / SingleQMultiTransform / QScanMulti).
+This version keeps the scanning capabilities of the original QTAM_Scan.py while using
+the windowing, energy-normalization, integer-shift demodulation and amplitude-modulation
+remodulation/inversion logic from QTAM.py.
+"""
 
-# ============================
-# VECTORIZED BATCHED WINDOWS
-# ============================
+# -------------------------------------------------------------------------------------------------------------
 
-import torch
-import torch.nn.functional as F
-import math
-
-#-------------------------------------------------------------------------------------------------------------
 def _centered_pad_or_crop(X: torch.Tensor, M: int) -> torch.Tensor:
     """Helper for ideal band-pass filtering via crop/pad in FFT domain."""
     N = X.shape[-1]
     if M == N:
         return X
-    # Use F.fftshift, assuming `import torch.nn.functional as F`
     Xs = torch.fft.fftshift(X, dim=-1)
     if M > N:
         pad_left = (M - N) // 2
@@ -36,181 +37,168 @@ def _centered_pad_or_crop(X: torch.Tensor, M: int) -> torch.Tensor:
         end = start + M
         Y = Xs[..., start:end]
     return torch.fft.ifftshift(Y, dim=-1)
-#-------------------------------------------------------------------------------------------------------
+
+# -------------------------------------------------------------------------------------------------------
+
+def _phasor_from_integer_shift(shift: int, T: int, device, dtype, sign: int = +1):
+    """
+    Return rot[n] = exp(sign * i * 2π * shift * n / T)
+    computed via integer modulo so phases stay in [0, 2π) for float32 stability.
+    """
+    n = torch.arange(T, device=device, dtype=torch.int64)  # [T]
+    shift_mod = int(shift) % T
+    m = (shift_mod * n) % T  # [T] integers in [0, T)
+    phase = (sign * (2.0 * math.pi) / T) * m.to(dtype)  # [T] in [0, 2π)
+    return torch.polar(torch.ones(T, device=device, dtype=dtype), phase)  # complex
 
 
-def planck_taper_window_range_batch(N: int, epsilon: torch.Tensor, x_min: float = -1, x_max: float = 1, device: str = 'cpu') -> torch.Tensor:
+def _phasor_from_integer_shifts(shifts: torch.Tensor, T: int, device, dtype, sign: int = +1):
     """
-    Constructs Planck-taper windows for a batch of epsilon values over an 
-    arbitrary range [x_min, x_max], using the specific algebraic formula 
-    from the user's original scalar function for Z.
+    Batched version of _phasor_from_integer_shift for a 1-D tensor of shifts.
+    Returns rot of shape [len(shifts), T].
     """
-    # 1. Coordinate Generation and Mapping (N samples)
-    x = torch.linspace(x_min, x_max, steps=N, device=device, dtype=torch.float32)
+    n = torch.arange(T, device=device, dtype=torch.int64)  # [T]
+    shifts = torch.as_tensor(shifts, device=device, dtype=torch.int64) % T  # [F]
+    m = (shifts.view(-1, 1) * n.view(1, -1)) % T  # [F, T]
+    phase = (sign * (2.0 * math.pi) / T) * m.to(dtype)  # [F, T]
+    return torch.polar(torch.ones_like(phase), phase)  # [F, T]
+
+# ============================
+# External Window Functions
+# ============================
+
+def planck_taper_window_range(N: int, epsilon: float, x_min: float = -1, x_max: float = 1,
+                                device: str = 'cpu', data_type=torch.float32) -> torch.Tensor:
+    """
+    Constructs a Planck-taper window defined over an arbitrary range [x_min, x_max].
+    Internally, it maps the coordinate linearly to the canonical range [-1,1] and then
+    applies the Planck-taper formula.
+
+    Args:
+        N (int): Window length (number of samples).
+        epsilon (float): Taper fraction (0 < epsilon < 0.5).
+        x_min (float): Minimum value of the input coordinate.
+        x_max (float): Maximum value of the input coordinate.
+        device (str): Device.
+
+    Returns:
+        Tensor: A 1D tensor of shape [N] representing the Planck-taper window.
+    """
+    x = torch.linspace(x_min, x_max, steps=N, device=device, dtype=data_type)
     x_canonical = 2 * (x - x_min) / (x_max - x_min) - 1
     y = (x_canonical + 1) / 2
-    
-    # E is the number of epsilon values (batch size)
-    E = epsilon.numel()
-    
-    # 2. Reshaping for Broadcasting
-    epsilon_rs = epsilon.to(device).float().view(E, 1)
-    y_rs = y.view(1, N)
-    y_expanded = y_rs.expand(E, N) # Expanded y coordinate for correct indexing
-    
-    # 3. Initialization of the Window Tensor
-    w = torch.ones(E, N, device=device, dtype=torch.float32)
-    
-    # 4. Rising Edge: 0 < y < epsilon
-    mask_rise = (y_rs > 0) & (y_rs < epsilon_rs)
-    if mask_rise.any():
-        y_masked = y_expanded[mask_rise]
-        epsilon_masked = epsilon_rs.expand(E, N)[mask_rise]
-        
-        # *** CORRECTION APPLIED HERE (Matching original scalar function) ***
-        Z_plus = 2 * epsilon_masked * (
-            1 / (1 + 2 * y_masked - 1) + 
-            1 / (1 - 2 * epsilon_masked + 2 * y_masked - 1)
-        )
-        
-        w[mask_rise] = 1.0 / (torch.exp(Z_plus) + 1.0)
-        
-    # 5. Flat Region: epsilon <= y <= 1 - epsilon (Handled by initialization)
-    
-    # 6. Falling Edge: 1 - epsilon < y < 1
-    mask_fall = (y_rs > (1 - epsilon_rs)) & (y_rs < 1)
-    if mask_fall.any():
-        y_masked = y_expanded[mask_fall]
-        epsilon_masked = epsilon_rs.expand(E, N)[mask_fall]
-        
-        # *** CORRECTION APPLIED HERE (Matching original scalar function) ***
-        Z_minus = 2 * epsilon_masked * (
-            1 / (1 - 2 * y_masked + 1) + 
-            1 / (1 - 2 * epsilon_masked - 2 * y_masked + 1)
-        )
+    w = torch.ones(N, device=device, dtype=data_type)
 
+    mask_rise = (y > 0) & (y < epsilon)
+    if mask_rise.any():
+        Z_plus = 2 * epsilon * (
+            1 / (1 + 2 * y[mask_rise] - 1) +
+            1 / (1 - 2 * epsilon + 2 * y[mask_rise] - 1)
+        )
+        w[mask_rise] = 1.0 / (torch.exp(Z_plus) + 1.0)
+
+    mask_flat = (y >= epsilon) & (y <= 1 - epsilon)
+    w[mask_flat] = 1.0
+
+    mask_fall = (y > (1 - epsilon)) & (y < 1)
+    if mask_fall.any():
+        Z_minus = 2 * epsilon * (
+            1 / (1 - 2 * y[mask_fall] + 1) +
+            1 / (1 - 2 * epsilon - 2 * y[mask_fall] + 1)
+        )
         w[mask_fall] = 1.0 / (torch.exp(Z_minus) + 1.0)
 
-    # 7. Endpoints set to 0
-    w[:, 0] = 0.0
-    w[:, -1] = 0.0
-    
+    w[0] = 0.0
+    w[-1] = 0.0
     return w
 
-def kaiser_window_range_batch(L: int, beta: torch.Tensor, x_min: float = -1, x_max: float = 1, device: str = 'cpu') -> torch.Tensor:
-    """
-    Constructs Kaiser windows for a batch of beta values.
-    The window values are independent of the coordinate range [x_min, x_max].
-    
-    Args:
-        L (int): Window length.
-        beta (torch.Tensor): 1D tensor of Kaiser beta parameters.
-        x_min (float): Minimum coordinate value (ignored for window calculation).
-        x_max (float): Maximum coordinate value (ignored for window calculation).
-        device (str): Device.
-        
-    Returns:
-        Tensor: A 2D tensor of shape [B, L] representing the Kaiser windows,
-                where B is the number of beta values.
-    """
-    # B is the number of beta values (batch size)
-    B = beta.numel()
-    
-    # 1. Coordinate (Index) Setup
-    # The Kaiser window formula uses an index m from 0 to L-1.
-    # We define m_norm in the range [-1, 1] for the formula.
-    m = torch.arange(L, dtype=torch.float32, device=device)
-    m_norm = (2 * m / (L - 1)) - 1
-    
-    # Reshape m_norm to [1, L] for broadcasting
-    m_norm_rs = m_norm.view(1, L)
-    
-    # 2. Reshape beta to [B, 1] for broadcasting
-    beta_rs = beta.to(device).float().view(B, 1)
 
-    # 3. Calculate the argument for the Bessel function: sqrt(1 - m_norm^2)
-    arg_sqrt = torch.sqrt(1 - m_norm_rs.pow(2)) # Shape [1, L]
-    
-    # 4. Calculate the numerator: I_0(beta * sqrt(1 - m_norm^2))
-    numerator_arg = beta_rs * arg_sqrt # Shape [B, L]
-    numerator = torch.i0(numerator_arg) # Shape [B, L]
-    
-    # 5. Calculate the denominator: I_0(beta)
-    denominator = torch.i0(beta_rs) # Shape [B, 1]
-    
-    # 6. Calculate the window W = N / D
-    window = numerator / denominator # Shape [B, L]
-    
+def kaiser_window_range(L: int, beta: float = 8.6, x_min: float = -1, x_max: float = 1,
+                        device: str = 'cpu') -> torch.Tensor:
+    """
+    Returns a Kaiser window of length L defined over an arbitrary range [x_min, x_max].
+    The window values are generated by torch.kaiser_window (independent of the coordinate).
+    """
+    return torch.kaiser_window(L, beta=beta, periodic=False, device=device)
+
+
+def tukey_window(window_length, alpha=0.05, device='cpu'):
+    """Generates a Tukey window."""
+    if alpha < 0 or alpha > 1:
+        raise ValueError("Alpha must be between 0 and 1")
+    window = torch.ones(window_length, device=device)
+    if alpha == 0:
+        return window
+    ramp = int(alpha * window_length / 2)
+    if ramp == 0:
+        return window
+    w = torch.linspace(0, 1, ramp, device=device)
+    cosine = 0.5 * (1 + torch.cos(torch.pi * (w - 1)))
+    window[:ramp] = cosine
+    window[-ramp:] = cosine.flip(0)
     return window
 
-import torch
 
-def tukey_window_batch(window_length: int, alpha: torch.Tensor, device: str = 'cpu') -> torch.Tensor:
+def bisquare_window(L: int, device: str = 'cpu', data_type=torch.float32) -> torch.Tensor:
     """
-    Generates Tukey windows for a batch of alpha values, matching the 
-    integer-ramp-based logic of the user's original scalar function.
+    Compute the bisquare window defined as:
+    w(x) = (1 - x^2)^2, with x linearly spaced from -1 to 1.
     """
-    L = window_length
-    A = alpha.numel()
-    
-    # 1. Reshape alpha to [A, 1]
-    alpha_rs = alpha.to(device).float().view(A, 1)
+    x = torch.linspace(-1, 1, steps=L, device=device, dtype=data_type)
+    return (1 - x**2)**2
 
-    # 2. Initialize the result window W as [A, L] tensor of ones
-    W = torch.ones(A, L, device=device, dtype=torch.float32)
-    
-    # 3. Calculate the integer ramp length R for each alpha
-    # R = floor(alpha * L / 2). This must be computed for each alpha.
-    R_float = (alpha_rs * L / 2.0).floor().long() # Shape [A, 1]
-    
-    for i in range(A):
-        alpha_val = alpha[i].item()
-        R = R_float[i].item()
-        
-        # NOTE: We skip the alpha=0 check, as requested, but we handle the 
-        # R=0 case which is equivalent for the logic flow.
-        if R == 0 or alpha_val == 0.0:
-            # If R=0, the window remains all ones (W[i] = 1.0)
-            continue
-            
-        # 4. Create the linear space 'w' from 0 to 1 over the integer ramp length R
-        w = torch.linspace(0, 1, R, device=device, dtype=torch.float32)
-        
-        # 5. Calculate the cosine taper matching the user's original formula
-        # cosine = 0.5 * (1 + torch.cos(torch.pi * (w - 1)))
-        cosine = 0.5 * (1 + torch.cos(torch.pi * (w - 1)))
-        
-        # 6. Apply to the rising and falling edges of the i-th window
-        W[i, :R] = cosine
-        W[i, L - R:] = cosine.flip(0)
-        
-    return W
 
-def bisquare_window_batched(L: int, batch_size: int = 1, device: str = "cpu", epsilon: float = None) -> torch.Tensor:
-    """
-    Batched Bisquare windows.
-    """
-    x = torch.linspace(-1, 1, L, device=device)
-    w = (1 - x ** 2)** 2
- 
-    
-    if epsilon:
-        w[0]+=epsilon
-        w[-1]+=epsilon
-    return w.unsqueeze(0).expand(batch_size, -1)
-
-def hann_window_batched(L: int, batch_size: int = 1, device: str = "cpu", epsilon: float = None) -> torch.Tensor:
-    """
-    Batched Hann windows.
-    """
-    n = torch.arange(L, device=device, dtype=torch.float32)
+def hann_window(L: int, device: str = "cpu", data_type=torch.float32) -> torch.Tensor:
+    """Hann window."""
+    n = torch.arange(L, device=device, dtype=data_type)
     w = 0.5 * (1 - torch.cos(2 * math.pi * n / (L - 1)))
+    return w
 
-    if epsilon:
-        w[0]+=epsilon
-        w[-1]+=epsilon
+
+# ============================
+# Batched Window Wrappers
+# ============================
+
+def planck_taper_window_range_batch(N: int, epsilon: Union[List[float], torch.Tensor],
+                                    x_min: float = -1, x_max: float = 1,
+                                    device: str = 'cpu', data_type=torch.float32) -> torch.Tensor:
+    """Build Planck-taper windows for a batch of epsilon values, matching the scalar implementation exactly."""
+    epsilon = torch.as_tensor(epsilon, device=device, dtype=data_type).flatten()
+    windows = [
+        planck_taper_window_range(N, eps.item(), x_min, x_max, device, data_type)
+        for eps in epsilon
+    ]
+    return torch.stack(windows, dim=0)
+
+
+def kaiser_window_range_batch(L: int, beta: Union[List[float], torch.Tensor],
+                              device: str = 'cpu') -> torch.Tensor:
+    """Build Kaiser windows for a batch of beta values, matching the scalar implementation exactly."""
+    beta = torch.as_tensor(beta, device=device).flatten()
+    windows = [kaiser_window_range(L, b.item(), device=device) for b in beta]
+    return torch.stack(windows, dim=0)
+
+
+def tukey_window_batch(window_length: int, alpha: Union[List[float], torch.Tensor],
+                       device: str = 'cpu') -> torch.Tensor:
+    """Build Tukey windows for a batch of alpha values, matching the scalar implementation exactly."""
+    alpha = torch.as_tensor(alpha, device=device).flatten()
+    windows = [tukey_window(window_length, a.item(), device=device) for a in alpha]
+    return torch.stack(windows, dim=0)
+
+
+def bisquare_window_batched(L: int, batch_size: int = 1, device: str = "cpu",
+                            data_type=torch.float32) -> torch.Tensor:
+    """Batched Bisquare windows."""
+    w = bisquare_window(L, device=device, data_type=data_type)
     return w.unsqueeze(0).expand(batch_size, -1)
 
+
+def hann_window_batched(L: int, batch_size: int = 1, device: str = "cpu",
+                        data_type=torch.float32) -> torch.Tensor:
+    """Batched Hann windows."""
+    w = hann_window(L, device=device, data_type=data_type)
+    return w.unsqueeze(0).expand(batch_size, -1)
 
 
 # ============================
@@ -219,8 +207,9 @@ def hann_window_batched(L: int, batch_size: int = 1, device: str = "cpu", epsilo
 
 class QTileMulti(torch.nn.Module):
     """
-    Multi-configuration QTile: supports multiple window types and
-    parameter scans (taus, betas) in a fully vectorized way.
+    Multi-configuration QTile: supports multiple window types and parameter scans
+    (taus, betas) in a fully vectorized way. Uses the same energy normalization,
+    integer-shift demodulation, and remodulation logic as QTile in QTAM.py.
     """
 
     def __init__(
@@ -236,8 +225,10 @@ class QTileMulti(torch.nn.Module):
         logf: bool = False,
         eps: float = 1e-5,
         device: str = "cpu",
-        max_window_size = None # maximum width of window function
-
+        max_window_size=None,
+        frange: Optional[List[float]] = None,
+        from_0: bool = False,
+        is_first: bool = False,
     ):
         super().__init__()
         self.q = q
@@ -246,7 +237,7 @@ class QTileMulti(torch.nn.Module):
         self.sample_rate = sample_rate
         self.mismatch = mismatch
         self.logf = logf
-        self.max_window_size=max_window_size
+        self.max_window_size = max_window_size
         self.eps = eps
         self.device = device
 
@@ -254,55 +245,73 @@ class QTileMulti(torch.nn.Module):
         self.taus = torch.as_tensor(taus, device=device, dtype=torch.float32) if taus is not None else None
         self.betas = torch.as_tensor(betas, device=device, dtype=torch.float32) if betas is not None else None
 
-        # precompute constants
         self.qprime = self.q / (11.0 ** 0.5)
         self.deltam = torch.tensor(2 * (self.mismatch / 3.0) ** 0.5, device=device)
-        
+
         self.windowsize = 2 * int(self.frequency / self.qprime * self.duration) + 1
-        #print('-----------------------------')
         if self.max_window_size:
-            #print(f'{self.windowsize=} ; {self.max_window_size=}')
             self.windowsize = min(self.windowsize, self.max_window_size)
-            
-        self.pad_len = (self.duration*self.sample_rate)//2 +1 - self.windowsize
-        self.pad_left = int((self.pad_len) // 2)
+
+        self.pad_len = (self.duration * self.sample_rate) // 2 + 1 - self.windowsize
+        self.pad_left = int(self.pad_len // 2)
         self.pad_right = int((self.pad_len + 1) // 2)
 
-        config, window =  self.get_window()
-        
-        self.configs = config
+        self.frange = frange if frange is not None else [0.0, self.sample_rate / 2.0]
+        self.from_0 = from_0
+        self.is_first = is_first
+
+        configs, window = self.get_window()
+        self.configs = configs
         self.register_buffer("window", window)
         self.register_buffer("full_window", self.get_full_window())
 
     def get_window(self):
-        # Build all windows
+        """Build all requested windows and their configuration descriptors."""
+        dtype = torch.get_default_dtype()
         windows, configs = [], []
+
         for wtype in self.window_types:
-            
             if wtype is None or wtype.lower() == "bisquare":
-                win = bisquare_window_batched(self.windowsize, device=self.device, epsilon=self.eps)
-                cfgs = [(self.q,"bisquare", None, None)]
+                win = bisquare_window(self.windowsize, device=self.device, data_type=dtype).unsqueeze(0)
+                cfgs = [(self.q, "bisquare", None, None)]
+
             elif wtype.lower() == "hann":
-                win = hann_window_batched(self.windowsize, device=self.device, epsilon=self.eps)
-                cfgs = [(self.q,"hann", None, None)]
+                win = hann_window(self.windowsize, device=self.device, data_type=dtype).unsqueeze(0)
+                cfgs = [(self.q, "hann", None, None)]
+
             elif wtype.lower() == "tukey":
                 assert self.taus is not None, "Tukey requires taus"
-                #print(f'{self.taus=}')
-                win = tukey_window_batch(self.windowsize, self.taus.to(self.device), device=self.device)
-                cfgs = [(self.q,"tukey", tau.item(), None) for tau in self.taus]
+                tau_list = self.taus.flatten().tolist()
+                win = torch.stack([
+                    tukey_window(self.windowsize, alpha=tau, device=self.device).to(dtype)
+                    for tau in tau_list
+                ], dim=0)
+                cfgs = [(self.q, "tukey", tau, None) for tau in tau_list]
+
             elif wtype.lower() == "planck-taper":
                 assert self.taus is not None, "Planck-taper requires taus"
-                #print(f'{self.taus=}')
-                win = planck_taper_window_range_batch(self.windowsize, self.taus.to(self.device), -1, 1, device=self.device)
-                cfgs = [(self.q,"planck-taper", tau.item(), None) for tau in self.taus]
+                tau_list = self.taus.flatten().tolist()
+                win = torch.stack([
+                    planck_taper_window_range(
+                        self.windowsize, epsilon=tau, x_min=-1, x_max=1,
+                        device=self.device, data_type=dtype
+                    )
+                    for tau in tau_list
+                ], dim=0)
+                cfgs = [(self.q, "planck-taper", tau, None) for tau in tau_list]
+
             elif wtype.lower() == "kaiser":
                 assert self.betas is not None, "Kaiser requires betas"
-                #print(f'{self.betas=}')
-                win = kaiser_window_range_batch(self.windowsize, self.betas.to(self.device), device=self.device)
-                cfgs = [(self.q,"kaiser", None, beta.item()) for beta in self.betas]
+                beta_list = self.betas.flatten().tolist()
+                win = torch.stack([
+                    kaiser_window_range(self.windowsize, beta=beta, device=self.device).to(dtype)
+                    for beta in beta_list
+                ], dim=0)
+                cfgs = [(self.q, "kaiser", None, beta) for beta in beta_list]
+
             else:
-                raise ValueError(f"Unsupported window type {wtype}")
-            
+                raise ValueError(f"Unsupported window type: {wtype}")
+
             windows.append(win)
             configs.extend(cfgs)
 
@@ -310,141 +319,173 @@ class QTileMulti(torch.nn.Module):
         return configs, final_windows
 
     def compute_window_energy(self, window):
-        #Normalize by imposing Parseval condition: sum |w[t]|^2 dt = (1/N) * sum |W[f]|^2 = 1
-        return window.square().sum(dim=[0, 1, 3])/self.duration 
+        """Per-config window energy: sum |w|^2 / duration."""
+        # window shape: (1, 1, n_configs, T)
+        return window.square().sum(dim=(0, 1, 3)) / self.duration
 
     def get_full_window(self):
-        
-        # Pad window to full length with small epsilon and shift to center frequency
-        full = F.pad(self.window.unsqueeze(0).unsqueeze(0), (self.pad_left, self.pad_right), value=self.eps)
-
-        #Center window on central frequency
+        """Place each window at the integer frequency bin and normalize by energy."""
+        # Integer center only (required for exact multirate inversion)
         self.shift = int(self.frequency * self.duration)
-        #full_w= torch.roll(full, shifts=self.shift- (self.windowsize // 2 +self.pad_right))
-        full_w = torch.roll(full, shifts=self.shift - (self.pad_left + self.windowsize // 2))
 
-        #Normalize window    
-        wen=self.compute_window_energy(full_w)
-        norm = (wen) ** -0.5 
-        full_w *= norm[None,None,:,None]
+        total_len = self.pad_left + self.windowsize + self.pad_right
+        n_configs = self.window.shape[0]
+        full_w = torch.full(
+            (1, 1, n_configs, total_len),
+            0.0,
+            device=self.window.device,
+            dtype=self.window.dtype,
+        )
+
+        frange = list(self.frange)  # do not mutate the shared list
+        if self.from_0:
+            frange[0] = 0.0
+
+        center_idx = self.shift
+        half_left = self.windowsize // 2
+        half_right = self.windowsize - half_left - 1
+
+        win_start_idx = center_idx - half_left
+        win_end_idx = center_idx + half_right
+
+        dst_start = max(int(frange[0] * self.duration), win_start_idx)
+        dst_end = min(int(frange[1] * self.duration), win_end_idx)
+
+        if dst_start <= dst_end:
+            src_start = dst_start - win_start_idx
+            src_end = src_start + (dst_end - dst_start) + 1
+            full_w[:, :, :, dst_start:dst_end + 1] = \
+                self.window[:, src_start:src_end].unsqueeze(0).unsqueeze(0)
+
+        # DC patch (robust): extend the first nonzero placed value down to DC
+        if self.is_first and self.from_0:
+            for c in range(n_configs):
+                nz = (full_w[0, 0, c] != 0).nonzero(as_tuple=False).flatten()
+                if nz.numel() > 0:
+                    first_nz = int(nz[0].item())
+                    if first_nz > 0:
+                        full_w[0, 0, c, :first_nz] = full_w[0, 0, c, first_nz]
+
+        # Normalize per configuration
+        wen = self.compute_window_energy(full_w)
+        if torch.any(wen > 0):
+            full_w *= (wen ** -0.5).view(1, 1, -1, 1)
+
         return full_w
 
     def forward(
-        self, 
-        fseries: torch.Tensor, 
-        polar_mode: bool = True, 
-        energy_mode: bool = True, 
-        phase_mode: bool = True, 
+        self,
+        fseries: torch.Tensor,
+        polar_mode: bool = True,
+        energy_mode: bool = True,
+        phase_mode: bool = True,
         complex_mode: bool = False,
-        num_time: Optional[int] = None, # Target number of time samples
-        am_mode: bool = True             # True for baseband (amplitude), False for remodulated AM signal
+        num_time: Optional[int] = None,
+        am_mode: bool = True,
     ):
+        """
+        Compute the multi-configuration Q-tile for a single frequency.
+
+        Input:
+            fseries: (B, C, T) complex frequency series
+        Output (polar_mode):
+            (B, C, P, n_configs, T) where P = 2 if phase_mode else 1
+        Output (complex_mode):
+            (B, C, n_configs, T)
+        Output (real/imag otherwise):
+            (B, C, 2, n_configs, T)
+        """
         while len(fseries.shape) < 3:
             fseries = fseries[None]
-        
-        # Step 1: Bandpass filtering in frequency domain
-        
-        wenergy = fseries[:,:,None,:] * self.full_window.to(fseries.device)
+
+        # fseries: (B, C, T); full_window: (1, 1, n_configs, T)
+        wenergy = fseries[:, :, None, :] * self.full_window.to(fseries.device)
         T_in = wenergy.shape[-1]
 
-        
-        # If num_time is not specified, compute full resolution tile (original behavior)
         if num_time is None:
             tdenergy = torch.fft.ifft(wenergy, norm='ortho')
-            tdenergy *= (self.sample_rate)**0.5 
-        
-        # If num_time is specified, perform efficient downsampling
+            tdenergy *= (self.sample_rate) ** 0.5
         else:
             T_out = num_time
-            # Step 2: Demodulate by shifting to baseband in frequency domain
+            # Exact integer demodulation
             wenergy_baseband = torch.roll(wenergy, shifts=-self.shift, dims=-1)
-            
-            # Step 3: Low-pass filter by cropping the spectrum
             wenergy_baseband_cropped = _centered_pad_or_crop(wenergy_baseband, T_out)
-            
-            # Step 4: Perform small IFFT to get downsampled baseband signal
             tdenergy_baseband = torch.fft.ifft(wenergy_baseband_cropped, norm='ortho')
-            
-            # Apply amplitude correction for energy conservation
             tdenergy_baseband *= math.sqrt(T_out / T_in)
-            
-            if am_mode:
-                # We want the baseband signal (the envelope)
-                tdenergy = tdenergy_baseband * (self.sample_rate)**0.5
-            else:
-                # Step 5 (Optional): Remodulate to get AM signal
-                # Create time vector for the downsampled signal
-                t = torch.linspace(0, self.duration, T_out, device=fseries.device, dtype=torch.float32)
-                
-                # Create rotation phasor
-                phase = 2 * math.pi * self.frequency * t.view(1, 1, -1)
-                rot = torch.polar(torch.ones_like(phase), phase)
-                
-                # Apply remodulation
-                tdenergy = tdenergy_baseband * rot * (self.sample_rate)**0.5
 
-        # The rest of the function remains the same, converting the complex `tdenergy`
-        # to the desired output format (polar, complex, or real/imag)
+            if am_mode:
+                tdenergy = tdenergy_baseband * (self.sample_rate) ** 0.5
+            else:
+                # Float32-stable remodulation using integer-bin phasor
+                rot = _phasor_from_integer_shift(
+                    shift=self.shift,
+                    T=T_out,
+                    device=fseries.device,
+                    dtype=fseries.real.dtype,
+                    sign=+1,
+                ).view(1, 1, 1, -1)
+                tdenergy = tdenergy_baseband * rot * (self.sample_rate) ** 0.5
+
         if polar_mode:
             if energy_mode:
-                energy = tdenergy.real**2 + tdenergy.imag**2
+                energy = tdenergy.real ** 2 + tdenergy.imag ** 2
             else:
-                energy = torch.sqrt(tdenergy.real**2 + tdenergy.imag**2)
-    
-            phase = None
+                energy = torch.sqrt(tdenergy.real ** 2 + tdenergy.imag ** 2)
+
             if phase_mode:
                 phase = torch.atan2(tdenergy.imag, tdenergy.real)
-                return torch.stack([energy, phase],dim=2)
-                
+                return torch.stack([energy, phase], dim=2)
             return energy.unsqueeze(2)
-        
+
         elif complex_mode:
             return tdenergy
-        else:
-            return torch.stack([tdenergy.real,tdenergy.imag], dim=2)
-        
 
-    def invert(self, tile, polar_mode: bool = True, energy_mode: bool = True, phase_mode: bool = True, complex_mode: bool = False):
-        # Extract amplitude and phase from the tile
-        
+        else:
+            return torch.stack([tdenergy.real, tdenergy.imag], dim=2)
+
+    def invert(self, tile, polar_mode: bool = True, energy_mode: bool = True,
+               phase_mode: bool = True, complex_mode: bool = False):
+        """
+        Invert a single multi-configuration tile back to the frequency domain.
+
+        Input shapes:
+            polar_mode: (B, C, P, n_configs, T)
+            complex_mode: (B, C, n_configs, T)
+            real/imag:  (B, C, 2, n_configs, T)
+        Output:
+            (B, C, n_configs, T) complex frequency series
+        """
         if polar_mode:
             amplitude = torch.sqrt(tile[:, :, 0]) if energy_mode else tile[:, :, 0]
-            
             if not phase_mode:
-                print(f"\033[93m[Warning]\033[0m Qtile.invert: phase_mode is False, assuming all 0 phase.")
+                print("\033[93m[Warning]\033[0m QTileMulti.invert: phase_mode is False, assuming all 0 phase.")
+            amplitude /= (self.sample_rate) ** 0.5
 
-            amplitude /= (self.sample_rate)**0.5
-            
             if phase_mode:
                 phase = tile[:, :, 1]
             else:
                 phase = torch.zeros_like(amplitude)
-                
-            tdenergy = amplitude * torch.exp(1j * phase)   
-            
-        elif complex_mode:
-            tdenergy= tile/(self.sample_rate)**0.5
-        else:
-            tdenergy= torch.complex(tile[:,:,0,:],tile[:,:,1,:])/ (self.sample_rate)**0.5
-        
-        # FFT back to frequency domain
-        wenergy = torch.fft.fft(tdenergy, norm= 'ortho')
 
-        # Divide by full_window to recover original fseries
+            tdenergy = amplitude * torch.exp(1j * phase)
+
+        elif complex_mode:
+            tdenergy = tile / (self.sample_rate) ** 0.5
+        else:
+            tdenergy = torch.complex(tile[:, :, 0, :], tile[:, :, 1, :]) / (self.sample_rate) ** 0.5
+
+        wenergy = torch.fft.fft(tdenergy, norm='ortho')
         fseries = wenergy / self.full_window
-        
         return fseries
-        
+
+
 ##########################################################################
-# Single Q Qtransform Class
+# Single Q Multi-Configuration Qtransform Class
 ##########################################################################
 
 class SingleQMultiTransform(torch.nn.Module):
     """
     Compute the Q-transform for a single Q value and multiple window configurations.
     Uses QTileMulti to handle multiple parameter combinations (taus, betas, window types).
-
-    For now, it computes all configurations without selecting the best one.
     """
 
     def __init__(
@@ -458,8 +499,7 @@ class SingleQMultiTransform(torch.nn.Module):
         mismatch: float = 0.2,
         num_freq: int = 0,
         logf: bool = False,
-        max_window_size = False,
-
+        max_window_size=False,
         window_types: Optional[List[str]] = None,
         taus: Optional[Union[List[float], torch.Tensor]] = None,
         betas: Optional[Union[List[float], torch.Tensor]] = None,
@@ -482,21 +522,19 @@ class SingleQMultiTransform(torch.nn.Module):
         self.betas = betas
 
         qprime = self.q / 11 ** 0.5
-        if self.frange[0] <= 0:
-            self.frange[0] = 50 * self.q / (2 * torch.pi * duration)
+        self.from_0 = (self.frange[0] <= 0)
+        if self.from_0:
+            self.frange[0] = 10 * self.q / (2 * torch.pi * duration)
         if math.isinf(self.frange[1]):
             self.frange[1] = sample_rate / 2 / (1 + 1 / qprime)
 
-        # Frequency grid
         self.freqs = self.get_freqs()
 
         if max_window_size:
-            #print(f'{max_window_size=}')
-            self.max_window_size =self.get_max_window_size(max_window_size)
+            self.max_window_size = self.get_max_window_size(max_window_size)
         else:
             self.max_window_size = None
 
-        # Create QTileMulti for each frequency
         self.qtile_multi_transforms = torch.nn.ModuleList([
             QTileMulti(
                 q=self.q,
@@ -511,233 +549,259 @@ class SingleQMultiTransform(torch.nn.Module):
                 device=self.device,
                 max_window_size=self.max_window_size,
                 eps=self.eps,
+                frange=self.frange.copy(),
+                from_0=self.from_0,
+                is_first=(i == 0),
             )
-            for freq in self.freqs
+            for i, freq in enumerate(self.freqs)
         ])
 
         self.qtiles = None
+        self.configs = np.array(self.qtile_multi_transforms[0].configs, dtype=object)
 
-        self.configs=np.array(self.qtile_multi_transforms[0].configs, dtype=object)
-
-    
     def get_freqs(self):
         """
         Calculate the frequencies that will be used in this transform.
-        For each frequency, a `QTile` is created.
+        For each frequency, a QTileMulti is created.
         """
         minf, maxf = self.frange
 
-        # manually set log spaced frequencies given the desired number of tiles
         if self.num_freq:
             if self.logf:
                 freqs = torch.tensor(np.geomspace(minf, maxf, self.num_freq))
             else:
-                freqs=torch.linspace(minf,maxf,self.num_freq)
-
-        # use gwpy mismatch method instead
+                freqs = torch.linspace(minf, maxf, self.num_freq)
         else:
             fcum_mismatch = (
-                math.log(maxf / minf) * (2 + self.q**2) ** (1 / 2.0) / 2.0
+                math.log(maxf / minf) * (2 + self.q ** 2) ** (1 / 2.0) / 2.0
             )
             deltam = 2 * (self.mismatch / 3.0) ** (1 / 2.0)
             nfreq = int(max(1, math.ceil(fcum_mismatch / deltam)))
             fstep = fcum_mismatch / nfreq
             fstepmin = 1 / self.duration
-    
-            freq_base = math.exp(2 / ((2 + self.q**2) ** (1 / 2.0)) * fstep)
+
+            freq_base = math.exp(2 / ((2 + self.q ** 2) ** (1 / 2.0)) * fstep)
             freqs = torch.Tensor([freq_base ** (i + 0.5) for i in range(nfreq)])
             freqs = (minf * freqs // fstepmin) * fstepmin
+
         return torch.unique(freqs)
+
+    def get_max_window_size(self, max_w_s: Optional[Union[int, str]]):
+        """Determine the final max_window_size based on user input."""
+        if max_w_s is None:
+            print("[Info] No max_window_size cap applied. Using pure CQT scaling.")
+            return None
+
+        if isinstance(max_w_s, (int, float)):
+            max_size = int(max_w_s)
+            print(f"[Info] Using user-defined max_window_size cap: {max_size}")
+            if len(self.freqs) > 1:
+                freq_spacings = torch.diff(self.freqs)
+                max_spacing_hz = torch.max(freq_spacings)
+                principled_min_size = (math.ceil(self.duration * max_spacing_hz.item()) // 2) * 2 + 1
+                if max_size < principled_min_size:
+                    print(
+                        f"[Warning] User-defined cap ({max_size}) is smaller than the "
+                        f"principled minimum ({principled_min_size}) required to guarantee "
+                        f"no frequency gaps. This may affect invertibility."
+                    )
+            return max_size
+
+        if isinstance(max_w_s, str) and max_w_s.lower() == 'auto':
+            if len(self.freqs) > 1:
+                freq_spacings = torch.diff(self.freqs)
+                max_spacing_hz = torch.max(freq_spacings)
+                max_size = (math.ceil(self.duration * max_spacing_hz.item()) // 2) * 2 + 1
+                print(f"[Info] Using auto-calculated principled max_window_size: {max_size}")
+                return max_size
+            else:
+                print("[Info] Only one frequency bin; no max_window_size cap is needed.")
+                return None
+
+        raise ValueError(
+            f"Invalid input for max_window_size. Must be None, an integer, or 'auto'. Got: {max_w_s}"
+        )
 
     def get_max_energy(
         self,
         fsearch_range: Optional[List[float]] = None,
-        criterion: str = "total",   # "pixel", "total", "median"
-        per_element: bool = True,   # True -> per (B,C); False -> global
+        criterion: str = "total",
+        per_element: bool = True,
         energy_mode: bool = True,
         phase_mode: bool = True,
         polar_mode: bool = True,
         complex_mode: bool = False,
+        return_idx: bool = False,
     ):
         """
         Compute maximum energy among configurations of this SingleQMultiTransform.
-    
-        Returns:
-            best_val:  [B, C] or scalar
-            best_idx:  [B, C] or scalar (index into self.configs)
-            best_spec: [B, C, n_freq, T] or [n_freq, T]
-        """
 
+        Returns:
+            best_val: [B, C] or scalar
+            best_configs: numpy.ndarray (dtype=object) shape [B, C] or scalar
+            best_spec: [B, C, n_freq, T] or [n_freq, T]
+            best_idx (optional): [B, C] or scalar, index into self.configs
+        """
         if complex_mode:
-            raise ValueError(f"Scan works only for real tensors (complex_mode = False=")
+            raise ValueError("Scan works only for real tensors (complex_mode=False)")
         if not polar_mode:
-            raise ValueError(f"Scan works only for amplitude/energy (polar_mode = True)")
-            
-        
-        
-        if phase_mode:
-            qtiles = self.qtiles[:,:,:,0,:,:]
-        else:
-            qtiles = self.qtiles  # [B, C, n_cfg, n_freq, T]
-    
-        # restrict frequency range if requested
+            raise ValueError("Scan works only for amplitude/energy (polar_mode=True)")
+        if self.qtiles is None:
+            raise RuntimeError("Q-tiles must first be computed with .compute_qtiles()")
+
+        # self.qtiles shape is [B, C, P, n_cfg, n_freqs, T]
+        # Use the energy/amplitude channel (index 0 of P) for the selection criterion.
+        energy_qtiles = self.qtiles[:, :, 0, ...]  # [B, C, n_cfg, n_freqs, T]
+
+        # Restrict frequency range if requested
         if fsearch_range is not None and self.freqs is not None:
             fmask = (self.freqs >= fsearch_range[0]) & (self.freqs <= fsearch_range[1])
-            qtiles = qtiles[..., fmask, :]
-        
+            energy_qtiles = energy_qtiles[..., fmask, :]
+
         if energy_mode:
-            energy=qtiles
+            energy = energy_qtiles
         else:
-            energy = qtiles.pow(2)  # [B, C, n_cfg, n_freq, T]
-    
-        # ---- compute energy metric per configuration ----
+            energy = energy_qtiles.pow(2)  # [B, C, n_cfg, n_freqs, T]
+
+        # Compute energy metric per configuration
         if criterion == "pixel":
             energy_metric = energy.amax(dim=(-1, -2))  # [B, C, n_cfg]
         elif criterion == "total":
-            energy_metric = energy.sum(dim=(-1, -2))   # [B, C, n_cfg]
+            energy_metric = energy.sum(dim=(-1, -2))  # [B, C, n_cfg]
         elif criterion == "median":
-            energy_metric = energy.median(dim=-1).values.median(dim=-1).values
+            energy_metric = energy.median(dim=-1).values.median(dim=-1).values  # [B, C, n_cfg]
         else:
             raise ValueError(f"Unknown criterion '{criterion}'")
-    
-        # ---- choose best configuration ----
+
+        # Choose best configuration
         if per_element:
             best_val, best_idx = torch.max(energy_metric, dim=-1)  # [B, C]
         else:
             global_mean = energy_metric.mean(dim=(0, 1))  # [n_cfg]
             best_idx = torch.argmax(global_mean)
             best_val = global_mean[best_idx]
-    
-        # ---- extract best spectrogram ----
+
+        # Extract best spectrogram keeping the full polar dimension
+        # If phase_mode was True, self.qtiles has P=2, otherwise P=1.
         if per_element:
-            B, C, n_cfg, F, T = qtiles.shape
-            best_spec = torch.zeros((B, C, F, T), dtype=qtiles.dtype, device=qtiles.device)
+            B, C, P, n_cfg, F, T = self.qtiles.shape
+            best_spec = torch.zeros((B, C, P, F, T), dtype=self.qtiles.dtype, device=self.qtiles.device)
             for b in range(B):
                 for c in range(C):
-                    best_spec[b, c] = qtiles[b, c, best_idx[b, c]]
+                    best_spec[b, c] = self.qtiles[b, c, :, best_idx[b, c], :, :]
         else:
-            best_spec = qtiles[..., best_idx, :, :].mean(dim=(0, 1))
-        
+            best_spec = self.qtiles[..., best_idx, :, :].mean(dim=(0, 1))  # [P, F, T]
+
         best_idx_numpy = best_idx.detach().cpu().numpy()
         best_configs = self.configs[best_idx_numpy]
 
+        if return_idx:
+            return best_val, best_configs, best_spec, best_idx
         return best_val, best_configs, best_spec
 
-    
     def compute_qtiles(
-        self, 
-        X: torch.Tensor, 
-        polar_mode: bool = True, 
-        energy_mode: bool = True, 
-        phase_mode: bool = True, 
+        self,
+        X: torch.Tensor,
+        polar_mode: bool = True,
+        energy_mode: bool = True,
+        phase_mode: bool = True,
         complex_mode: bool = False,
-        num_time: Optional[int] = None, 
-        am_mode: bool = True,         
-                             ):
-        """
-        Compute the Q-tiles for all frequencies and all configurations.
-        """
-        X = torch.fft.rfft(X, norm="ortho")
-        
-        all_qtiles = [qmulti(
-                X, polar_mode, energy_mode, phase_mode, complex_mode,
-                num_time=num_time, am_mode=am_mode
-            ) for qmulti in self.qtile_multi_transforms ]
-            
-        # Stack across frequencies
-        self.qtiles = torch.stack(all_qtiles, dim=-2)  # [B, C,(2) ,n_cfg, n_freqs, T]
-##########################################################################
-    ### FOURIER INTERPOLATION ###
+        num_time: Optional[int] = None,
+        am_mode: bool = True,
+    ):
+        """Compute the Q-tiles for all frequencies and all configurations."""
+        X_fft = torch.fft.rfft(X, norm="ortho")
+
+        all_qtiles = [
+            qmulti(
+                X_fft,
+                polar_mode, energy_mode, phase_mode, complex_mode,
+                num_time=num_time, am_mode=am_mode,
+            )
+            for qmulti in self.qtile_multi_transforms
+        ]
+
+        # Stack across frequencies: [B, C, P, n_cfg, n_freqs, T]
+        self.qtiles = torch.stack(all_qtiles, dim=-2)
+
+    # ------------------------------------------------------------------
+    # Fourier-domain resampling (downsample / upsample)
+    # ------------------------------------------------------------------
+
     def _centered_pad_or_crop(self, X: torch.Tensor, M: int) -> torch.Tensor:
         """Helper for ideal band-pass filtering via crop/pad in FFT domain."""
-        N = X.shape[-1]
-        if M == N:
-            return X
-        # Use F.fftshift, assuming `import torch.nn.functional as F`
-        Xs = torch.fft.fftshift(X, dim=-1)
-        if M > N:
-            pad_left = (M - N) // 2
-            pad_right = M - N - pad_left
-            Y = F.pad(Xs, (pad_left, pad_right))
-        else:
-            start = (N - M) // 2
-            end = start + M
-            Y = Xs[..., start:end]
-        return torch.fft.ifftshift(Y, dim=-1)
+        return _centered_pad_or_crop(X, M)
 
     def _row_mod(self, Zc: torch.Tensor, sign: int) -> torch.Tensor:
-        """Helper to apply phase rotation for remodulation (sign=+1) or demodulation (sign=-1)."""
+        """
+        Apply exp(sign * i * 2π * shift_k * n / T) per frequency row k,
+        computed with integer modulo for float32 stability.
+        """
         B, C, n_freqs, T = Zc.shape
-        device = Zc.device
-        dtype = Zc.real.dtype
-        
-        step = self.duration / T
-        end_point = self.duration #- step
-        t = torch.linspace(0, end_point, T, device=device, dtype=dtype)
-        
-        f = self.freqs.to(device, dtype).view(1, 1, n_freqs, 1)
-        phase = 2 * math.pi * f * t.view(1, 1, 1, T)
-        rot = torch.polar(torch.ones_like(phase), sign * phase)
+        shifts = torch.tensor(
+            [qt.shift for qt in self.qtile_multi_transforms],
+            device=Zc.device, dtype=torch.int64,
+        )
+        rot = _phasor_from_integer_shifts(shifts, T, Zc.device, Zc.real.dtype, sign)
+        rot = rot.view(1, 1, n_freqs, T)
         return Zc * rot
 
-    def downsample(self, Z_in, T_out: int, polar_mode: bool, energy_mode: bool, phase_mode: bool, complex_mode: bool, preserve_amplitude=True, remod: bool = False):
-        """
-        Downsamples the spectrogram using the stable frequency-domain method.
-        Handles various input formats by passing mode flags.
-        """
+    def downsample(self, Z_in, T_out: int,
+                   polar_mode: bool, energy_mode: bool, phase_mode: bool,
+                   complex_mode: bool, preserve_amplitude=True, remod: bool = False):
+        """Downsample the spectrogram using the stable frequency-domain method."""
         T_in = Z_in.shape[-1]
         if T_in == T_out:
             return Z_in
 
-        # --- 1. Convert any input format to complex tdenergy ---
+        # Convert to complex
         if polar_mode:
             amplitude = torch.sqrt(Z_in[:, :, 0]) if energy_mode else Z_in[:, :, 0]
             phase = Z_in[:, :, 1] if phase_mode else torch.zeros_like(amplitude)
             if not phase_mode:
-                print(f"\033[93m[Warning]\033[0m phase_mode is False, assuming all 0 phase.")
+                print("\033[93m[Warning]\033[0m phase_mode is False, assuming all 0 phase.")
             Zc_in = torch.polar(amplitude, phase)
         elif complex_mode:
             Zc_in = Z_in
-        else: # Real/Imag channels
+        else:
             Zc_in = torch.complex(Z_in[:, :, 0], Z_in[:, :, 1])
-            
-        # --- 2. Core resampling logic (operates on complex values) ---
+
         Zf_in = torch.fft.fft(Zc_in, dim=-1, norm='ortho')
         C_k_ds_list = []
+
         for k, qt in enumerate(self.qtile_multi_transforms):
-            center_freq_bin = qt.shift
-            print(f'frequency:{self.freqs[k]}, idx:{k}, shift: {qt.shift}')
             Zf_k = Zf_in[:, :, k, :]
-            Zf_k_bb = torch.roll(Zf_k, shifts=-center_freq_bin, dims=-1)
+            # Exact integer demodulation
+            Zf_k_bb = torch.roll(Zf_k, shifts=-qt.shift, dims=-1)
             Zf_k_bb_cropped = self._centered_pad_or_crop(Zf_k_bb, T_out)
             C_k_ds = torch.fft.ifft(Zf_k_bb_cropped, dim=-1, norm='ortho')
             C_k_ds_list.append(C_k_ds)
+
         C_ds = torch.stack(C_k_ds_list, dim=2)
-        
+
         if preserve_amplitude:
             C_ds *= math.sqrt(T_out / T_in)
-            
-        if remod==True:
+
+        if remod:
             Zc_out = self._row_mod(C_ds, sign=+1)
         else:
-            Zc_out= C_ds 
-        
-        # --- 3. Convert complex output back to the original format ---
+            Zc_out = C_ds
+
+        # Convert back
         if polar_mode:
-            energy = Zc_out.abs()**2 if energy_mode else Zc_out.abs()
+            energy = Zc_out.abs() ** 2 if energy_mode else Zc_out.abs()
             if phase_mode:
-                phase = Zc_out.angle()
-                return torch.stack([energy, phase], dim=2)
+                return torch.stack([energy, Zc_out.angle()], dim=2)
             return energy.unsqueeze(2)
         elif complex_mode:
             return Zc_out
-        else: # Real/Imag channels
+        else:
             return torch.stack([Zc_out.real, Zc_out.imag], dim=2)
 
-    def upsample(self, Z_coarse, T_in: int, polar_mode: bool, energy_mode: bool, phase_mode: bool, complex_mode: bool, preserve_amplitude=True, demod:bool = False):
-        """
-        Upsamples the spectrogram by reversing the frequency-domain process.
-        """
+    def upsample(self, Z_coarse, T_in: int,
+                 polar_mode: bool, energy_mode: bool, phase_mode: bool,
+                 complex_mode: bool, preserve_amplitude=True, demod: bool = False):
+        """Upsample the spectrogram by reversing the frequency-domain process."""
         T_out = Z_coarse.shape[-1]
         if T_in == T_out:
             return Z_coarse
@@ -746,152 +810,231 @@ class SingleQMultiTransform(torch.nn.Module):
             amplitude = torch.sqrt(Z_coarse[:, :, 0]) if energy_mode else Z_coarse[:, :, 0]
             phase = Z_coarse[:, :, 1] if phase_mode else torch.zeros_like(amplitude)
             if not phase_mode:
-                print(f"\033[93m[Warning]\033[0m phase_mode is False, assuming all 0 phase.")
+                print("\033[93m[Warning]\033[0m phase_mode is False, assuming all 0 phase.")
             Zc_coarse = torch.polar(amplitude, phase)
         elif complex_mode:
             Zc_coarse = Z_coarse
-        else: # Real/Imag channels
+        else:
             Zc_coarse = torch.complex(Z_coarse[:, :, 0], Z_coarse[:, :, 1])
-            
-        if demod == True:  
+
+        if demod:
             C_ds = self._row_mod(Zc_coarse, sign=-1)
         else:
             C_ds = Zc_coarse
-        
+
         Zf_k_recon_list = []
         for k, qt in enumerate(self.qtile_multi_transforms):
             C_k_ds = C_ds[:, :, k, :]
             Zf_k_bb_cropped = torch.fft.fft(C_k_ds, dim=-1, norm='ortho')
             Zf_k_bb = self._centered_pad_or_crop(Zf_k_bb_cropped, T_in)
-            center_freq_bin = qt.shift
-            Zf_k_recon = torch.roll(Zf_k_bb, shifts=center_freq_bin, dims=-1)
+            # Exact integer remodulation
+            Zf_k_recon = torch.roll(Zf_k_bb, shifts=qt.shift, dims=-1)
             Zf_k_recon_list.append(Zf_k_recon)
-        
+
         Zf_recon = torch.stack(Zf_k_recon_list, dim=2)
         Zc_out = torch.fft.ifft(Zf_recon, dim=-1, norm='ortho')
-        
+
         if preserve_amplitude:
             Zc_out *= math.sqrt(T_in / T_out)
-    
+
         if polar_mode:
-            energy = Zc_out.abs()**2 if energy_mode else Zc_out.abs()
+            energy = Zc_out.abs() ** 2 if energy_mode else Zc_out.abs()
             if phase_mode:
-                phase = Zc_out.angle()
-                return torch.stack([energy, phase], dim=2)
+                return torch.stack([energy, Zc_out.angle()], dim=2)
             return energy.unsqueeze(2)
         elif complex_mode:
             return Zc_out
-        else: # Real/Imag channels
+        else:
             return torch.stack([Zc_out.real, Zc_out.imag], dim=2)
 
     def check_aliasing_and_report(self, T_out: int):
         """
         Checks for potential information loss (aliasing) and reports detailed diagnostics,
-        taking into account the VQT `max_window_size` if it is set.
+        taking into account the VQT max_window_size if it is set.
         """
         print("\n--- Downsampling Analysis ---")
-        qprime = self.q / (11**0.5)
+        qprime = self.q / (11 ** 0.5)
         duration = self.duration
         cqt_sizes = 2 * torch.floor(self.freqs.cpu() / qprime * duration) + 1
-        
+
         max_size = getattr(self, 'max_window_size', None)
-        
+
         if max_size is not None:
             print(f"[Info] VQT mode detected with max_window_size = {max_size}")
             final_sizes = torch.minimum(cqt_sizes, torch.tensor(float(max_size)))
         else:
             print("[Info] Pure CQT mode detected (no window size cap).")
             final_sizes = cqt_sizes
-            
+
         n_bins_required = final_sizes.numpy()
         aliasing_mask = T_out < n_bins_required
         n_bad = int(aliasing_mask.sum())
-    
+
         min_T_out_for_lossless = int(np.max(n_bins_required))
-        
+
         supported_mask = ~aliasing_mask
         max_f_supported = float(self.freqs[supported_mask].max().item()) if supported_mask.any() else 0.0
-        
+
         if n_bad > 0:
             affected_freqs = self.freqs.cpu().numpy()[aliasing_mask]
             print(f"\033[93m[Warning]\033[0m {n_bad}/{len(self.freqs)} frequency rows will be truncated (information loss).")
-            print(f"          Your chosen T_out = {T_out} is too small for the windows being used.")
-            print(f"          Affected frequencies start from ~{affected_freqs.min():.2f} Hz upwards.")
+            print(f" Your chosen T_out = {T_out} is too small for the windows being used.")
+            print(f" Affected frequencies start from ~{affected_freqs.min():.2f} Hz upwards.")
             print("-" * 20)
             print(f"To be lossless for all frequencies, you MUST use at least T_out = {min_T_out_for_lossless}.")
             print(f"With T_out = {T_out}, the maximum fully supported frequency is ~{max_f_supported:.2f} Hz.")
         else:
             print("[Info] No information loss detected.")
-            print(f"       Your chosen T_out = {T_out} is sufficient for lossless resampling.")
-            print(f"       (Minimum required T_out for this spectrogram is {min_T_out_for_lossless}).")
-        
+            print(f" Your chosen T_out = {T_out} is sufficient for lossless resampling.")
+            print(f" (Minimum required T_out for this spectrogram is {min_T_out_for_lossless}).")
+
         print("---------------------------\n")
         return torch.from_numpy(aliasing_mask)
-##########################################################################
-    
-        
+
+    # ------------------------------------------------------------------
+    # Inversion (full reconstruction from a selected single-config spectrogram)
+    # ------------------------------------------------------------------
+
+    def invert_qtransform(
+        self,
+        qtransform,
+        polar_mode: bool = True,
+        energy_mode: bool = True,
+        phase_mode: bool = True,
+        complex_mode: bool = False,
+        am_mode: bool = True,
+        config_idx: int = 0,
+    ):
+        """
+        Invert a single-configuration Q-transform spectrogram back to the time domain.
+
+        Input shape:
+            polar_mode: (B, C, P, n_freqs, T)
+            complex_mode: (B, C, n_freqs, T)
+            real/imag:  (B, C, 2, n_freqs, T)
+        Output:
+            (B, C, T) time-domain signal
+
+        Args:
+            config_idx: which window configuration to use for the frequency-domain windows
+                        (must match the configuration used to produce the spectrogram).
+        """
+        n_configs = self.qtile_multi_transforms[0].window.shape[0]
+        if n_configs > 1:
+            warnings.warn(
+                f"QTileMulti has {n_configs} window configurations. "
+                f"Ensure config_idx={config_idx} matches the configuration used to produce the spectrogram."
+            )
+        if len(qtransform.shape) < 2:
+            raise ValueError("Input must have at least 2 dimensions F, T.")
+
+        if (not polar_mode) and complex_mode:
+            while len(qtransform.shape) < 4:
+                qtransform = qtransform.unsqueeze(0)
+        else:
+            while len(qtransform.shape) < 5:
+                qtransform = qtransform.unsqueeze(0)
+
+        if qtransform.shape[2] > 2:
+            raise ValueError(f"Phase dimension [2] expected to be 1 or 2, found {qtransform.shape[2]} instead")
+
+        n_samples_original = int(self.sample_rate * self.duration) // 2 + 1
+        n_times_input = qtransform.shape[-1]
+
+        if n_times_input < n_samples_original:
+            print(f"Input spectrogram is downsampled (T={n_times_input}). "
+                  f"Upsampling to original T={n_samples_original} before inversion...")
+            qtransform = self.upsample(
+                qtransform, n_samples_original,
+                polar_mode=polar_mode, energy_mode=energy_mode, phase_mode=phase_mode,
+                complex_mode=complex_mode, preserve_amplitude=True, demod=not am_mode,
+            )
+        elif n_times_input > n_samples_original:
+            print(f"Input spectrogram is upsampled (T={n_times_input}). "
+                  f"Downsampling to original T={n_samples_original} before inversion...")
+            qtransform = self.downsample(
+                qtransform, n_samples_original,
+                polar_mode=polar_mode, energy_mode=energy_mode, phase_mode=phase_mode,
+                complex_mode=complex_mode, preserve_amplitude=True, remod=not am_mode,
+            )
+
+        # Convert entire spectrogram from Energy/Phase (or Re/Im) to complex tdenergy
+        if polar_mode:
+            amplitude = torch.sqrt(qtransform[:, :, 0]) if energy_mode else qtransform[:, :, 0]
+            amplitude /= (self.sample_rate) ** 0.5
+            if phase_mode:
+                phase = qtransform[:, :, 1]
+            else:
+                phase = torch.zeros_like(amplitude)
+            tdenergy = amplitude * torch.exp(1j * phase)
+        elif complex_mode:
+            tdenergy = qtransform / (self.sample_rate) ** 0.5
+        else:
+            tdenergy = torch.complex(qtransform[:, :, 0, :, :], qtransform[:, :, 1, :, :]) / (self.sample_rate) ** 0.5
+
+        # FFT all tdenergy tiles to get their windowed spectra
+        wenergy = torch.fft.fft(tdenergy, norm='ortho')
+
+        # Stack the full windows of the selected configuration
+        # QTileMulti.full_window shape: (1, 1, n_configs, T_freq)
+        all_windows = torch.stack([
+            qt.full_window[0, 0, config_idx, :]
+            for qt in self.qtile_multi_transforms
+        ])  # (n_freqs, T_freq)
+
+        # Wiener-like reconstruction: sum(wenergy * window) / sum(window^2)
+        numerator = torch.sum(wenergy * all_windows[None, None, :, :].to(wenergy.device), dim=2)
+        denominator = torch.sum(all_windows ** 2, dim=0).to(wenergy.device)
+
+        mask = denominator > 0
+        fseries_reconstructed = torch.zeros_like(numerator)
+        fseries_reconstructed[:, :, mask] = numerator[:, :, mask] / denominator[mask].view(1, 1, -1)
+
+        x_rec = torch.fft.irfft(fseries_reconstructed, norm='ortho', n=int(self.sample_rate * self.duration))
+        return x_rec
+
+    # ------------------------------------------------------------------
+    # Forward pass
+    # ------------------------------------------------------------------
+
     def forward(
         self,
         X: torch.Tensor,
-        
-        #spectroram parameters
         normalize: bool = False,
         polar_mode: bool = True,
         energy_mode: bool = True,
         phase_mode: bool = True,
         complex_mode: bool = False,
-        
-        #interpolation parameters
-        interp_mode : str = None, #other modes is 'spline' but not implemented yet
-        num_time : int = None,
+        interp_mode: str = None,
+        num_time: int = None,
         am_mode: bool = True,
-
     ):
-        """
-        Compute multi-configuration Q-transform.
-        Returns results for all configurations (no selection).
-        """
-
+        """Compute multi-configuration Q-transform. Returns all configurations."""
         if normalize:
-            X_norm=X.clone()
-            X_norm/=torch.max(X_norm,dim=-1).values.unsqueeze(-1)
-            X=X_norm
-            
-        # Path 1: Efficiently compute downsampled transform directly
+            X_norm = X.clone()
+            X_norm /= torch.max(X_norm, dim=-1).values.unsqueeze(-1)
+            X = X_norm
+
         if num_time is not None:
-            
-            # Check for aliasing before computation
             T_in = (int(self.sample_rate * self.duration) // 2) + 1
             if num_time < T_in:
-                 self.check_aliasing_and_report(num_time)
-
+                self.check_aliasing_and_report(num_time)
             self.compute_qtiles(
                 X, polar_mode, energy_mode, phase_mode, complex_mode,
-                num_time=num_time, am_mode=am_mode
+                num_time=num_time, am_mode=am_mode,
             )
-
-
-        # Path 2: Compute full-res tiles for spline interpolation or raw output
         else:
             self.compute_qtiles(
-                X, polar_mode=polar_mode, energy_mode=energy_mode, phase_mode=phase_mode, complex_mode=complex_mode,
-                num_time=None, am_mode=am_mode # Ensures full resolution
+                X, polar_mode=polar_mode, energy_mode=energy_mode,
+                phase_mode=phase_mode, complex_mode=complex_mode,
+                num_time=None, am_mode=am_mode,
             )
-        '''
-        # --- Stack the computed tiles ---
-        if not polar_mode and complex_mode:
-            stacking_dim = 2 # B, C, F, T
-        else:
-            stacking_dim = 3 # B, C, P, F, T
-        qtiles_stacked = torch.stack(self.qtiles, dim=stacking_dim)
-        '''
 
         return self.qtiles
 
-    
 
 ##########################################################################
-# Multi Q Qtransform Class
+# Multi Q Qtransform Scanner Class
 ##########################################################################
 
 class QScanMulti(nn.Module):
@@ -915,7 +1058,7 @@ class QScanMulti(nn.Module):
         taus: Optional[List[float]] = None,
         betas: Optional[List[float]] = None,
         device: str = "cpu",
-        max_window_size = False,
+        max_window_size=False,
         logf: bool = True,
     ):
         super().__init__()
@@ -940,16 +1083,15 @@ class QScanMulti(nn.Module):
                 taus=taus,
                 betas=betas,
                 device=self.device,
-                max_window_size = self.max_window_size,
-                logf= self.logf,
+                max_window_size=self.max_window_size,
+                logf=self.logf,
             )
             for q in self.qs
         ])
 
-    # -------------------------------------------------------------------------
     def _get_qs(self):
+        """Calculate Q values to scan."""
         if self.qlist is None:
-            """Calculate Q values to scan."""
             deltam = 2 * (self.mismatch / 3.0) ** 0.5
             cumum = math.log(self.qrange[1] / self.qrange[0]) / 2 ** 0.5
             nplanes = int(max(math.ceil(cumum / deltam), 1))
@@ -960,114 +1102,184 @@ class QScanMulti(nn.Module):
             ]
         else:
             return self.qlist
-    # -------------------------------------------------------------------------
+
     def forward(
         self,
-        X: torch.Tensor, #input data
-        fsearch_range: Optional[List[float]] = None, # restrict frequency range if requested
-        criterion: str = "total", # 'total' : total energy of the spectrogram, 'pixel': highest pixel value in the spectrogram, 'median': median of spectrogram values
-        per_element: bool = True, #compute max per each element in batch and channel dim separately (True) or average over such dimension (False)
-        normalize: bool = False, # 
-        scan_mode ='True', # choose best configuration across Q and parameter values (True) or return MultiQMultiTransform (False)
+        X: torch.Tensor,
+        fsearch_range: Optional[List[float]] = None,
+        criterion: str = "total",
+        per_element: bool = True,
+        normalize: bool = False,
+        scan_mode='True',
         energy_mode: bool = True,
         phase_mode: bool = False,
         polar_mode: bool = True,
         complex_mode: bool = False,
-        
-        #interpolation parameters
-        interp_mode : str = None, #other modes is 'spline' but not implemented yet
-        num_time : int = None,
+        interp_mode: str = None,
+        num_time: int = None,
         am_mode: bool = True,
     ):
         """
-        Compute all Q transforms and select the best (Q, config)
-        combination per (B,C) or globally.
-    
+        Compute all Q transforms and select the best (Q, config) combination
+        per (B, C) or globally.
+
         Returns:
-             If scan_mode == True:
-                If per_element == True:
-                    best_spectrograms : list of lists [[spec_b0c0, spec_b0c1,...], [...]] where spec_b,c is a torch.Tensor [F_q, T_q]
-                    best_qs            : torch.Tensor of shape [B, C] containing the Q value chosen for each (b,c)
-                    best_configs       : numpy.ndarray (dtype=object) shape [B, C] with the winning config objects
-                If per_element == False:
-                    best_spec          : torch.Tensor [F_q, T_q] for the single global winner
-                    best_q             : scalar torch.Tensor (or float) of the winning Q
-                    best_config        : single config object (python object)
-             else:
-                results    : List of Torch tensors containing SingleQMultiTransforms, one for each Q value, i.e. len(results) = len(sef.qs)       
-            
+            If scan_mode == True:
+                per_element=True:  (best_spectrograms, best_qs, best_configs)
+                per_element=False: (best_spec, best_q, best_config)
+            else:
+                List of full SingleQMultiTransform outputs, one per Q.
         """
         results = []
         if scan_mode:
             for transform in self.transforms:
                 transform.compute_qtiles(
-                X, polar_mode=polar_mode, energy_mode=energy_mode, phase_mode=phase_mode, complex_mode=complex_mode,
-                num_time=num_time, am_mode=am_mode
-            )
+                    X, polar_mode=polar_mode, energy_mode=energy_mode,
+                    phase_mode=phase_mode, complex_mode=complex_mode,
+                    num_time=num_time, am_mode=am_mode,
+                )
                 best_val, best_configs, best_spec = transform.get_max_energy(
                     fsearch_range=fsearch_range,
                     criterion=criterion,
                     per_element=per_element,
+                    energy_mode=energy_mode,
+                    phase_mode=phase_mode,
+                    polar_mode=polar_mode,
+                    complex_mode=complex_mode,
                 )
-                # keep tuple per Q: (best_val, best_configs, best_spec, q_value)
                 results.append((best_val, best_configs, best_spec, transform.q))
-        
-            # Build tensor of best values across Qs
-            # results[i][0] is either [B,C] (per_element=True) or scalar (per_element=False)
+
             best_vals_list = [r[0] for r in results]
-        
+
             if per_element:
-                # stack => [n_Q, B, C]
-                best_vals = torch.stack(best_vals_list, dim=0)  # dtype and device from elements
-                # best_q_idx: [B, C] indices into results
-                best_q_idx = best_vals.argmax(dim=0)            # torch.LongTensor [B, C]
-        
-                # Prepare outputs
+                best_vals = torch.stack(best_vals_list, dim=0)  # [n_Q, B, C]
+                best_q_idx = best_vals.argmax(dim=0)  # [B, C]
+
                 B = X.shape[0]
                 C = X.shape[1]
-        
-                # best_qs_out: Q value per (B,C)
+
                 q_tensor = torch.tensor(self.qs, device=best_q_idx.device, dtype=best_q_idx.dtype)
                 best_qs_out = q_tensor[best_q_idx]  # [B, C]
-        
-                # Build nested lists for spectrograms and configs (because F_q may vary with q)
+
                 best_spectrograms = [[None for _ in range(C)] for _ in range(B)]
                 best_configs_out = np.empty((B, C), dtype=object)
-        
+
                 for b in range(B):
                     for c in range(C):
-                        q_idx = int(best_q_idx[b, c].item())  # index into results
-                        # results[q_idx][2] is best_spec for that Q
-                        # when per_element=True it's a tensor [B, C, F_q, T_q]
-                        spec_q = results[q_idx][2]             # tensor [B, C, F_q, T_q]
-                        cfgs_q = results[q_idx][1]             # numpy array (B, C) dtype=object
-        
-                        best_spectrograms[b][c] = spec_q[b, c]           # tensor [F_q, T_q]
-                        best_configs_out[b, c] = cfgs_q[b, c]            # python object
-        
+                        q_idx = int(best_q_idx[b, c].item())
+                        spec_q = results[q_idx][2]  # [B, C, F_q, T_q]
+                        cfgs_q = results[q_idx][1]  # (B, C) object array
+                        best_spectrograms[b][c] = spec_q[b, c]
+                        best_configs_out[b, c] = cfgs_q[b, c]
+
                 return best_spectrograms, best_qs_out, best_configs_out
-    
+
             else:
-                # per_element == False: find single winning Q (global)
-                # best_vals_list are scalars -> stack to [n_Q]
-                best_vals = torch.stack([torch.tensor(v, device='cpu') if not torch.is_tensor(v) else v for v in best_vals_list], dim=0)
-                # if some best_val were tensors on CPU/GPU, ensure we're consistent:
+                best_vals = torch.stack([
+                    torch.tensor(v, device='cpu') if not torch.is_tensor(v) else v
+                    for v in best_vals_list
+                ], dim=0)
                 best_vals = best_vals.to(self.device)
-                best_q_idx = int(best_vals.argmax().item())  # scalar index
-        
-                # take the results corresponding to the winning Q
+                best_q_idx = int(best_vals.argmax().item())
+
                 best_val_q, best_configs_q, best_spec_q, best_q_value = results[best_q_idx]
-        
-                # best_spec_q is expected to be [F_q, T_q] (per_element=False case in SingleQMultiTransform)
-                # best_configs_q is the single winning config (python object)
-                # best_q_value is a float
-                # return (spec, qvalue, config)
                 return best_spec_q, torch.tensor(best_q_value), best_configs_q
-        
+
         else:
             for transform in self.transforms:
-                qt=transform(X, normalize=normalize, polar_mode=polar_mode, energy_mode=energy_mode, phase_mode=phase_mode, complex_mode=complex_mode,
-                num_time=num_time, am_mode=am_mode)
+                qt = transform(
+                    X, normalize=normalize, polar_mode=polar_mode,
+                    energy_mode=energy_mode, phase_mode=phase_mode,
+                    complex_mode=complex_mode, num_time=num_time, am_mode=am_mode,
+                )
                 results.append(qt)
             return results
 
+    # -------------------------------------------------------------------------
+    def invert_scan(
+        self,
+        best_spectrograms,
+        best_qs_out,
+        best_configs_out,
+        polar_mode: bool = True,
+        energy_mode: bool = True,
+        phase_mode: bool = True,
+        complex_mode: bool = False,
+        am_mode: bool = True,
+    ):
+        """
+        Invert the results of a scan_mode=True QScanMulti.forward call.
+
+        Args:
+            best_spectrograms: nested list [B][C] -> (F, T) tensor
+            best_qs_out:         (B, C) tensor of chosen Q values
+            best_configs_out:    (B, C) numpy object array of (q, win_type, tau, beta)
+
+        Returns:
+            x_rec: (B, C, T) reconstructed time-domain signal
+        """
+        def _to_tuple(obj):
+            """Robustly convert a numpy object scalar/array or tuple into a Python tuple."""
+            if isinstance(obj, np.ndarray):
+                if obj.ndim == 0:
+                    obj = obj.item()
+                else:
+                    return tuple(obj.tolist())
+            if isinstance(obj, tuple):
+                return obj
+            return (obj,)
+
+        def _configs_equal(cfg_a, cfg_b):
+            """Compare config tuples, using np.isclose for numeric entries."""
+            if len(cfg_a) != len(cfg_b):
+                return False
+            for a, b in zip(cfg_a, cfg_b):
+                if isinstance(a, (int, float, np.number)) and isinstance(b, (int, float, np.number)):
+                    if not np.isclose(a, b):
+                        return False
+                elif a != b:
+                    return False
+            return True
+
+        B = len(best_spectrograms)
+        C = len(best_spectrograms[0])
+        n_samples = int(self.transforms[0].sample_rate * self.transforms[0].duration)
+        x_rec = torch.zeros((B, C, n_samples), device=self.device)
+
+        q_array = np.array(self.qs)
+
+        for b in range(B):
+            for c in range(C):
+                q_val = float(best_qs_out[b, c].item())
+                # find the SingleQMultiTransform corresponding to this Q value
+                transform_idx = int(np.argmin(np.abs(q_array - q_val)))
+                transform = self.transforms[transform_idx]
+
+                # robustly find the index of the chosen window config
+                cfg_target = _to_tuple(best_configs_out[b, c])
+                config_idx = None
+                for i, cfg in enumerate(transform.configs):
+                    if _configs_equal(_to_tuple(cfg), cfg_target):
+                        config_idx = i
+                        break
+                if config_idx is None:
+                    raise ValueError(
+                        f"Could not find config {cfg_target} in transform for Q={q_val}. "
+                        f"Available configs: {transform.configs.tolist()}"
+                    )
+
+                # best_spectrograms is energy-only (F, T); add batch/channel/P dims
+                # best_spectrograms[b][c] has shape (P, F, T) where P=1 or 2
+                spec = best_spectrograms[b][c].unsqueeze(0).unsqueeze(0)  # (1, 1, P, F, T)
+                P = spec.shape[2]
+                x_rec[b, c] = transform.invert_qtransform(
+                    spec,
+                    polar_mode=True,
+                    energy_mode=True,
+                    phase_mode=(P > 1),
+                    complex_mode=False,
+                    am_mode=am_mode,
+                    config_idx=config_idx,
+                )[0, 0]
+
+        return x_rec
