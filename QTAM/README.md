@@ -23,6 +23,9 @@ cd Qtransform_torch
 
 * **`glitch_for_testing.pkl`**
   File containing a $0.2$-second long *Scattered Light* glitch which is imported into `QTAM_Example_Usage.ipynb` to demonstrate a de-noising application.
+  
+* **`torch_spline_interpolation_1_0_0.py`**
+   A Python module providing functions for 1D and 2D spline interpolation.
 
 ## 📄 License
 
