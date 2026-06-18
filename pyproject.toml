@@ -1,31 +1,38 @@
+#[build-system]
+#requires = ["setuptools>=61.0", "wheel"]
+#build-backend = "setuptools.build_meta"
+
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=61.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "qtam"
-version = "1.0.0"
-description = "Q-transform with Amplitude Modulation (QTAM) for PyTorch"
-readme = "README.md"
-license = {file = "LICENSE"}
+version = "0.2.1"
 authors = [
-    {name = "Lorenzo Asprea", email = "lorenzo.asprea@to.infn.it"},
+    {name = "Lorenzo Asprea", email = "lorenzo.asprea@gmail.com"},
+    {name = "Francesco Sarandrea", email = "fsarandrea94@gmail.com"},
 ]
-classifiers = [
-    "Development Status :: 4 - Beta",
-    "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: GNU General Public License v3.0",
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Topic :: Scientific/Engineering :: Physics",
-]
+description = "PyTorch implementation of invertible Q-Transform with Ampltude Modulation"
+readme = "README.md"
 requires-python = ">=3.8"
+license = {file = "LICENSE"}
+classifiers = [
+	"Development Status :: 4 - Beta",
+	"Intended Audience :: Science/Research",
+	"Operating System :: OS Independent",
+	"License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+	"Programming Language :: Python :: 3",
+	"Programming Language :: Python :: 3.8",
+	"Programming Language :: Python :: 3.9",
+	"Programming Language :: Python :: 3.10",
+	"Programming Language :: Python :: 3.11",
+	"Topic :: Scientific/Engineering :: Physics",
+]
+
 dependencies = [
-    "torch",
-    "numpy",
+    "torch>=1.9.0",
+    "numpy>=1.20.0",
     "scipy",
     "matplotlib",
     "pandas",
@@ -34,13 +41,33 @@ dependencies = [
     "gwosc",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=6.0", "black", "flake8"]
+full = ["torch_spline_interpolation>=1.0.0"]
+
+
 [project.urls]
 Homepage = "https://github.com/dottormale/Qtransform_torch"
 Repository = "https://github.com/dottormale/Qtransform_torch"
 
 [tool.setuptools]
-packages = ["QTAM"]
-include-package-data = true
+package-dir = {"" = "src"}
+packages = ["qtam"]
 
-[tool.setuptools.package-data]
-QTAM = ["*.ipynb", "*.pkl"]
+#[tool.setuptools.packages.find]
+#where = ["src"]
+
+# Optional: development tool configurations
+[tool.black]
+line-length = 88
+target-version = ['py37', 'py38', 'py39', 'py310', 'py311']
+
+[tool.flake8]
+max-line-length = 88
+extend-ignore = ["E203", "W503"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v"
+
+
