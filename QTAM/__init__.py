@@ -6,7 +6,7 @@ supporting single‑Q and multi‑Q transforms, multiple window families,
 and efficient down/upsampling.
 """
 
-__version__ = "0.2.0"   # update to reflect the new code from the collaborator
+__version__ = "0.2.1"   
 
 # Core functionality (single‑Q, single‑config)
 from .QTAM import (
