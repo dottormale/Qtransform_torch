@@ -229,6 +229,9 @@ class QTileMulti(torch.nn.Module):
         frange: Optional[List[float]] = None,
         from_0: bool = False,
         is_first: bool = False,
+        is_last: bool = False,
+        spacing: str = 'geometric',
+        synthesis_to_nyquist: bool = False,
     ):
         super().__init__()
         self.q = q
@@ -259,6 +262,9 @@ class QTileMulti(torch.nn.Module):
         self.frange = frange if frange is not None else [0.0, self.sample_rate / 2.0]
         self.from_0 = from_0
         self.is_first = is_first
+        self.is_last = is_last
+        self.spacing = spacing
+        self.synthesis_to_nyquist = synthesis_to_nyquist
 
         configs, window = self.get_window()
         self.configs = configs
@@ -340,6 +346,8 @@ class QTileMulti(torch.nn.Module):
         frange = list(self.frange)  # do not mutate the shared list
         if self.from_0:
             frange[0] = 0.0
+        if self.is_last and (self.spacing == 'nyquist' or self.synthesis_to_nyquist):
+            frange[1] = float(self.sample_rate) / 2.0
 
         center_idx = self.shift
         half_left = self.windowsize // 2
@@ -495,11 +503,15 @@ class SingleQMultiTransform(torch.nn.Module):
         spectrogram_shape: Tuple[int, int],
         q: float = 12,
         eps: float = 1e-5,
-        frange: List[float] = [0, torch.inf],
+        frange: Optional[List[float]] = None,
         mismatch: float = 0.2,
         num_freq: int = 0,
         logf: bool = False,
+        spacing: str = 'geometric',
         max_window_size=False,
+        from_0: bool = True,
+        warn_on_bad_coverage: bool = True,
+        raise_on_bad_coverage: bool = False,
         window_types: Optional[List[str]] = None,
         taus: Optional[Union[List[float], torch.Tensor]] = None,
         betas: Optional[Union[List[float], torch.Tensor]] = None,
@@ -508,25 +520,46 @@ class SingleQMultiTransform(torch.nn.Module):
         super().__init__()
         self.q = q
         self.spectrogram_shape = spectrogram_shape
-        self.frange = frange
         self.duration = duration
+        self.sample_rate = sample_rate
         self.mismatch = mismatch
         self.logf = logf
+        self.spacing = spacing
         self.device = device
         self.eps = eps
-
-        self.sample_rate = sample_rate
         self.num_freq = num_freq
         self.window_types = window_types
         self.taus = taus
         self.betas = betas
+        self.warn_on_bad_coverage = warn_on_bad_coverage
+        self.raise_on_bad_coverage = raise_on_bad_coverage
 
-        qprime = self.q / 11 ** 0.5
-        self.from_0 = (self.frange[0] <= 0)
-        if self.from_0:
-            self.frange[0] = 10 * self.q / (2 * torch.pi * duration)
-        if math.isinf(self.frange[1]):
-            self.frange[1] = sample_rate / 2 / (1 + 1 / qprime)
+        # `frange` is the requested analysis/synthesis band.  Keep the
+        # automatically chosen centre-frequency range separate, and never
+        # mutate a caller's list or a shared default.
+        if frange is None:
+            frange = [0.0, float('inf')]
+        if len(frange) != 2:
+            raise ValueError("frange must be None or a two-element [f_min, f_max] sequence")
+        self._frange_input = [float(frange[0]), float(frange[1])]
+        analysis_fmax = (sample_rate / 2.0 if math.isinf(self._frange_input[1])
+                         else self._frange_input[1])
+        self.frange = [self._frange_input[0], analysis_fmax]
+        self.qprime = self.q / math.sqrt(11.0)
+        self.from_0 = from_0 or (self.frange[0] <= 0)
+
+        if self.spacing not in ('geometric', 'mismatch', 'linear', 'nyquist'):
+            raise ValueError("spacing must be 'geometric', 'mismatch', 'linear', or 'nyquist'")
+        if self.spacing == 'nyquist' and math.isinf(self._frange_input[1]):
+            raise ValueError("spacing='nyquist' requires an explicit f_max <= Nyquist")
+
+        grid_min = self.frange[0] if self.frange[0] > 0 else self.qprime / self.duration
+        auto_last_centre = (sample_rate / 2.0) / (1.0 + 1.0 / (2.0 * self.qprime))
+        grid_max = auto_last_centre if math.isinf(self._frange_input[1]) else self._frange_input[1]
+        if grid_max <= grid_min:
+            raise ValueError("centre-frequency maximum must exceed the minimum")
+        self.center_frange = [float(grid_min), float(grid_max)]
+        self._synthesis_to_nyquist = (self.spacing != 'nyquist' and math.isinf(self._frange_input[1]))
 
         self.freqs = self.get_freqs()
 
@@ -550,41 +583,161 @@ class SingleQMultiTransform(torch.nn.Module):
                 max_window_size=self.max_window_size,
                 eps=self.eps,
                 frange=self.frange.copy(),
-                from_0=self.from_0,
+                from_0=(self.from_0 and i == 0),
                 is_first=(i == 0),
+                is_last=(i == len(self.freqs) - 1),
+                spacing=self.spacing,
+                synthesis_to_nyquist=(self._synthesis_to_nyquist and i == len(self.freqs) - 1),
             )
             for i, freq in enumerate(self.freqs)
         ])
 
         self.qtiles = None
         self.configs = np.array(self.qtile_multi_transforms[0].configs, dtype=object)
+        self._coverage_report = self._check_coverage()
+        self._report_coverage()
 
     def get_freqs(self):
         """
         Calculate the frequencies that will be used in this transform.
         For each frequency, a QTileMulti is created.
         """
-        minf, maxf = self.frange
+        minf, maxf = self.center_frange
 
         if self.num_freq:
-            if self.logf:
-                freqs = torch.tensor(np.geomspace(minf, maxf, self.num_freq))
+            if self.spacing in ('geometric', 'nyquist') or self.logf:
+                freqs = torch.tensor(np.geomspace(minf, maxf, self.num_freq), dtype=torch.float64)
             else:
-                freqs = torch.linspace(minf, maxf, self.num_freq)
-        else:
-            fcum_mismatch = (
-                math.log(maxf / minf) * (2 + self.q ** 2) ** (1 / 2.0) / 2.0
-            )
-            deltam = 2 * (self.mismatch / 3.0) ** (1 / 2.0)
+                freqs = torch.linspace(minf, maxf, self.num_freq, dtype=torch.float64)
+            return torch.unique(freqs)
+
+        if self.spacing == 'mismatch':
+            warnings.warn("QTAM scan: spacing='mismatch' is legacy and may leave gaps; "
+                          "use spacing='geometric' for the principled grid.", RuntimeWarning)
+            fcum_mismatch = math.log(maxf / minf) * math.sqrt(2 + self.q ** 2) / 2.0
+            deltam = 2 * math.sqrt(self.mismatch / 3.0)
             nfreq = int(max(1, math.ceil(fcum_mismatch / deltam)))
             fstep = fcum_mismatch / nfreq
             fstepmin = 1 / self.duration
+            freq_base = math.exp(2 / math.sqrt(2 + self.q ** 2) * fstep)
+            freqs = torch.tensor([freq_base ** (i + 0.5) for i in range(nfreq)], dtype=torch.float64)
+            return torch.unique((minf * freqs // fstepmin) * fstepmin)
 
-            freq_base = math.exp(2 / ((2 + self.q ** 2) ** (1 / 2.0)) * fstep)
-            freqs = torch.Tensor([freq_base ** (i + 0.5) for i in range(nfreq)])
-            freqs = (minf * freqs // fstepmin) * fstepmin
-
+        # Principled geometric default: B intervals per octave and nfreq+1 centres.
+        B = max(1, int(math.ceil(self.q * math.log(2))))
+        nfreq = max(1, int(math.ceil(B * math.log2(maxf / minf))))
+        freqs = torch.tensor([minf * 2.0 ** (k / B) for k in range(nfreq + 1)], dtype=torch.float64)
+        freqs[0], freqs[-1] = minf, maxf
         return torch.unique(freqs)
+
+    def _coverage_for_band(self, band: Optional[List[float]] = None) -> dict:
+        """Exact discrete coverage for every scanned window configuration."""
+        if band is None:
+            band = self.frange
+        band = [float(band[0]), float(band[1])]
+        nyquist = float(self.sample_rate) / 2.0
+        first_bin = max(0, int(math.ceil(band[0] * self.duration)))
+        last_bin = min(int(nyquist * self.duration),
+                       int(math.floor(band[1] * self.duration)))
+
+        # [F, Cfg, Nfft] -> [Cfg, Nfft]
+        windows = torch.stack([
+            qt.full_window.squeeze(0).squeeze(0) for qt in self.qtile_multi_transforms
+        ])
+        denominator = windows.square().sum(dim=0)
+        reports = []
+        for cfg_idx in range(denominator.shape[0]):
+            missing = torch.nonzero(
+                denominator[cfg_idx, first_bin:last_bin + 1] <= 0,
+                as_tuple=False,
+            ).flatten() + first_bin
+            bins = missing.detach().cpu().tolist()
+            runs = []
+            if bins:
+                start = previous = bins[0]
+                for b in bins[1:]:
+                    if b != previous + 1:
+                        runs.append((start, previous))
+                        start = b
+                    previous = b
+                runs.append((start, previous))
+            segments = [(a / self.duration, (b + 1) / self.duration) for a, b in runs]
+            reports.append({
+                "config_index": cfg_idx,
+                "covered": not bins,
+                "missing_fft_bins": bins,
+                "bad_segments": segments,
+            })
+        return {
+            "band": band,
+            "covered": all(r["covered"] for r in reports),
+            "configs": reports,
+        }
+
+    def _check_coverage(self, band: Optional[List[float]] = None) -> dict:
+        return self._coverage_for_band(band)
+
+    def _report_coverage(self) -> None:
+        report = self._coverage_report
+        if report["covered"]:
+            return
+        failed = [r for r in report["configs"] if not r["covered"]]
+        first = failed[0]["bad_segments"][0] if failed and failed[0]["bad_segments"] else None
+        where = f" First gap: [{first[0]:.3f}, {first[1]:.3f}] Hz." if first else ""
+        msg = (f"QTAM scan: window-bank coverage failed for {len(failed)}/"
+               f"{len(report['configs'])} window configuration(s).{where} "
+               "Increase max_window_size and/or num_freq, then run diagnose().")
+        if self.raise_on_bad_coverage:
+            raise RuntimeError(msg)
+        if self.warn_on_bad_coverage:
+            warnings.warn(msg, RuntimeWarning, stacklevel=2)
+
+    def diagnose(self) -> dict:
+        """Print concise grid and exact-coverage diagnostics for the scan bank."""
+        nyquist = float(self.sample_rate) / 2.0
+        requested = self._check_coverage(self.frange)
+        full = self._check_coverage([0.0, nyquist])
+        B_safe = max(1, int(math.ceil(self.q * math.log(2))))
+        ref_points = 1 + max(1, int(math.ceil(
+            B_safe * math.log2(self.center_frange[1] / self.center_frange[0])
+        )))
+        print("\n" + "=" * 72)
+        print("QTAM SCAN DIAGNOSIS")
+        print("=" * 72)
+        print(f"  q={self.q:g}; duration={self.duration:g} s; sample_rate={self.sample_rate:g} Hz")
+        print(f"  analysis band : [{self.frange[0]:.3f}, {self.frange[1]:.3f}] Hz")
+        print(f"  centre range  : [{self.freqs[0]:.3f}, {self.freqs[-1]:.3f}] Hz")
+        print(f"  grid          : {len(self.freqs)} centres; spacing={self.spacing}")
+        if self.num_freq and len(self.freqs) < ref_points:
+            print(f"  [NOTE] conservative grid reference: {ref_points} centres; exact coverage below is decisive.")
+        if self.max_window_size is None:
+            print("  window cap    : none")
+        else:
+            centre_bins = [int(float(f) * self.duration) for f in self.freqs]
+            gap = max(b - a for a, b in zip(centre_bins[:-1], centre_bins[1:])) if len(centre_bins) > 1 else 0
+            cap_ref = gap + 2
+            if cap_ref % 2 == 0:
+                cap_ref += 1
+            label = "[OK]" if self.max_window_size >= cap_ref else "\033[91m[Warning]\033[0m"
+            print(f"  window cap    : {label} {self.max_window_size} (endpoint-safe reference: {cap_ref})")
+
+        def show(label, report):
+            failed = [r for r in report["configs"] if not r["covered"]]
+            if not failed:
+                print(f"  [OK]  Coverage: {label} (all {len(report['configs'])} configurations)")
+            else:
+                seg = failed[0]["bad_segments"][0]
+                print(f"  \033[91m[Warning]\033[0m Coverage: {label} -- "
+                      f"{len(failed)}/{len(report['configs'])} configurations fail; "
+                      f"first gap [{seg[0]:.3f}, {seg[1]:.3f}] Hz")
+
+        if abs(self.frange[0]) < 1e-12 and abs(self.frange[1] - nyquist) < 1e-12:
+            show(f"full spectrum [0, {nyquist:.3f}] Hz", full)
+        else:
+            show(f"requested band [{self.frange[0]:.3f}, {self.frange[1]:.3f}] Hz", requested)
+            show(f"full spectrum [0, {nyquist:.3f}] Hz", full)
+        return {"requested_band_coverage": requested, "full_spectrum_coverage": full,
+                "n_freq": len(self.freqs), "configs": self.configs}
 
     def get_max_window_size(self, max_w_s: Optional[Union[int, str]]):
         """Determine the final max_window_size based on user input."""
@@ -594,29 +747,31 @@ class SingleQMultiTransform(torch.nn.Module):
 
         if isinstance(max_w_s, (int, float)):
             max_size = int(max_w_s)
-            print(f"[Info] Using user-defined max_window_size cap: {max_size}")
             if len(self.freqs) > 1:
-                freq_spacings = torch.diff(self.freqs)
-                max_spacing_hz = torch.max(freq_spacings)
-                principled_min_size = (math.ceil(self.duration * max_spacing_hz.item()) // 2) * 2 + 1
+                centres = [int(float(f) * self.duration) for f in self.freqs]
+                gap = max(b - a for a, b in zip(centres[:-1], centres[1:]))
+                principled_min_size = gap + 2
+                if principled_min_size % 2 == 0:
+                    principled_min_size += 1
                 if max_size < principled_min_size:
-                    print(
-                        f"[Warning] User-defined cap ({max_size}) is smaller than the "
-                        f"principled minimum ({principled_min_size}) required to guarantee "
-                        f"no frequency gaps. This may affect invertibility."
+                    warnings.warn(
+                        "\033[91m[Warning]\033[0m "
+                        f"User-defined cap ({max_size}) is smaller than the "
+                        f"endpoint-safe minimum ({principled_min_size}); "
+                        "spectral gaps may occur. Run diagnose() for exact coverage.",
+                        RuntimeWarning, stacklevel=2,
                     )
             return max_size
 
         if isinstance(max_w_s, str) and max_w_s.lower() == 'auto':
             if len(self.freqs) > 1:
-                freq_spacings = torch.diff(self.freqs)
-                max_spacing_hz = torch.max(freq_spacings)
-                max_size = (math.ceil(self.duration * max_spacing_hz.item()) // 2) * 2 + 1
-                print(f"[Info] Using auto-calculated principled max_window_size: {max_size}")
+                centres = [int(float(f) * self.duration) for f in self.freqs]
+                gap = max(b - a for a, b in zip(centres[:-1], centres[1:]))
+                max_size = gap + 2
+                if max_size % 2 == 0:
+                    max_size += 1
                 return max_size
-            else:
-                print("[Info] Only one frequency bin; no max_window_size cap is needed.")
-                return None
+            return None
 
         raise ValueError(
             f"Invalid input for max_window_size. Must be None, an integer, or 'auto'. Got: {max_w_s}"
@@ -1060,13 +1215,15 @@ class QScanMulti(nn.Module):
         device: str = "cpu",
         max_window_size=False,
         logf: bool = True,
-    ):
+        spacing: str = 'geometric',
+    ): 
         super().__init__()
         self.qrange = qrange
         self.mismatch = mismatch
         self.qlist = qlist
         self.qs = self._get_qs()
         self.logf = logf
+        self.spacing = spacing
         self.frange = frange
         self.device = device
         self.max_window_size = max_window_size
@@ -1085,6 +1242,7 @@ class QScanMulti(nn.Module):
                 device=self.device,
                 max_window_size=self.max_window_size,
                 logf=self.logf,
+                spacing=self.spacing,
             )
             for q in self.qs
         ])
@@ -1102,6 +1260,16 @@ class QScanMulti(nn.Module):
             ]
         else:
             return self.qlist
+
+    def diagnose(self) -> dict:
+        """Run the single-Q diagnostic for every Q plane in this scan."""
+        reports = {}
+        for q, transform in zip(self.qs, self.transforms):
+            print("\n" + "#" * 72)
+            print(f"Q-SCAN PLANE: q={q:g}")
+            print("#" * 72)
+            reports[float(q)] = transform.diagnose()
+        return reports
 
     def forward(
         self,
